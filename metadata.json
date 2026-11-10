@@ -1,0 +1,6 @@
+{
+  "name": "ZeroLag Notes - Android Tablet Stylus Engine",
+  "description": "Production-ready, zero-lag PDF annotation and note-taking native Android engine & interactive simulator optimized for budget tablets and active styluses (Lenovo Precision Pen).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

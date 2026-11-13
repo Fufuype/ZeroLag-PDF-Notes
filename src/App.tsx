@@ -1,21 +1,34 @@
 import React, { useState, useRef, useCallback } from 'react';
-import { ToolMode, DocumentType, PalmRejectionLog } from './types';
+import { ToolMode, DocumentType, PalmRejectionLog, PageInfo } from './types';
 import { DrawingCanvas } from './components/DrawingCanvas';
 import { Toolbar } from './components/Toolbar';
 import { AndroidCodeHub } from './components/AndroidCodeHub';
 import { TabletSimulatorPanel } from './components/TabletSimulatorPanel';
-import { renderPdfFileToImage } from './utils/pdfHelper';
+import { PageThumbnailSidebar } from './components/PageThumbnailSidebar';
+import { renderAllPdfPages, RenderedPdfPage } from './utils/pdfHelper';
 
 export default function App() {
   const [currentMode, setCurrentMode] = useState<ToolMode>('pen');
-  const [strokeColor, setStrokeColor] = useState<string>('#0F172A');
-  const [strokeWidth, setStrokeWidth] = useState<number>(4);
 
-  // Document & Page state
+  // Kalem ve Vurgulayıcı için tamamen bağımsız renk ve kalınlık durumları
+  const [penColor, setPenColor] = useState<string>('#000000');
+  const [penWidth, setPenWidth] = useState<number>(4);
+  const [highlighterColor, setHighlighterColor] = useState<string>('#FBBF24');
+  const [highlighterWidth, setHighlighterWidth] = useState<number>(14);
+
+  // Aktif araca göre tuvale iletilen renk ve kalınlık
+  const activeStrokeColor = currentMode === 'highlighter' ? highlighterColor : penColor;
+  const activeStrokeWidth = currentMode === 'highlighter' ? highlighterWidth : penWidth;
+
+  // Document & Multi-Page state (alt alta dikey dizilim)
   const [documentType, setDocumentType] = useState<DocumentType>('template-spec');
-  const [customPdfImage, setCustomPdfImage] = useState<HTMLImageElement | null>(null);
-  const [currentPage, setCurrentPage] = useState<number>(0);
+  const [customPdfPages, setCustomPdfPages] = useState<RenderedPdfPage[]>([]);
+  const [activePageIndex, setActivePageIndex] = useState<number>(0);
   const [totalPages, setTotalPages] = useState<number>(2);
+
+  // Sol sekme (Google PDF tarzı küçük resim gezintisi)
+  const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(true);
+  const [pageThumbnails, setPageThumbnails] = useState<{ [pageIndex: number]: string }>({});
 
   // Undo / Redo states
   const [canUndo, setCanUndo] = useState<boolean>(false);
@@ -43,40 +56,63 @@ export default function App() {
     redo: () => void;
     clear: () => void;
     deleteSelected: () => void;
-    exportImage: (format: 'png') => string | null;
+    exportImage: (format: 'png', pageIndex?: number) => string | null;
+    scrollToPage: (pageIndex: number) => void;
   } | null>(null);
 
-  const handleCanvasRefCallback = useCallback((handlers: {
-    undo: () => void;
-    redo: () => void;
-    clear: () => void;
-    deleteSelected: () => void;
-    exportImage: (format: 'png') => string | null;
-  }) => {
-    canvasActionsRef.current = handlers;
-  }, []);
+  const handleCanvasRefCallback = useCallback(
+    (handlers: {
+      undo: () => void;
+      redo: () => void;
+      clear: () => void;
+      deleteSelected: () => void;
+      exportImage: (format: 'png', pageIndex?: number) => string | null;
+      scrollToPage: (pageIndex: number) => void;
+    }) => {
+      canvasActionsRef.current = handlers;
+    },
+    []
+  );
 
   const handlePalmEvent = useCallback((log: PalmRejectionLog) => {
     setEventLogs((prev) => [log, ...prev.slice(0, 40)]);
   }, []);
 
+  const handleThumbnailsUpdate = useCallback((newThumbs: { [pageIndex: number]: string }) => {
+    setPageThumbnails((prev) => ({ ...prev, ...newThumbs }));
+  }, []);
+
   const handleFileUpload = async (file: File) => {
     try {
       if (file.type === 'application/pdf') {
-        const { image, totalPages: pages } = await renderPdfFileToImage(file, 1);
-        setCustomPdfImage(image);
+        const pages = await renderAllPdfPages(file);
+        setCustomPdfPages(pages);
         setDocumentType('custom-pdf');
-        setCurrentPage(0);
-        setTotalPages(pages);
+        setActivePageIndex(0);
+        setTotalPages(pages.length);
+
+        const initialThumbs: { [key: number]: string } = {};
+        pages.forEach((p, idx) => {
+          initialThumbs[idx] = p.thumbnailUrl;
+        });
+        setPageThumbnails(initialThumbs);
       } else if (file.type.startsWith('image/')) {
         const reader = new FileReader();
         reader.onload = (e) => {
           const img = new Image();
           img.onload = () => {
-            setCustomPdfImage(img);
+            const singlePage: RenderedPdfPage = {
+              pageNumber: 1,
+              image: img,
+              width: img.width,
+              height: img.height,
+              thumbnailUrl: e.target?.result as string,
+            };
+            setCustomPdfPages([singlePage]);
             setDocumentType('custom-pdf');
-            setCurrentPage(0);
+            setActivePageIndex(0);
             setTotalPages(1);
+            setPageThumbnails({ 0: e.target?.result as string });
           };
           img.src = e.target?.result as string;
         };
@@ -89,12 +125,12 @@ export default function App() {
 
   const handleExport = () => {
     if (!canvasActionsRef.current) return;
-    const dataUrl = canvasActionsRef.current.exportImage('png');
+    const dataUrl = canvasActionsRef.current.exportImage('png', activePageIndex);
     if (!dataUrl) return;
 
     const link = document.createElement('a');
     link.href = dataUrl;
-    link.download = `ZeroLag_Not_Sayfa_${currentPage + 1}.png`;
+    link.download = `ZeroLag_Not_Sayfa_${activePageIndex + 1}.png`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -102,23 +138,59 @@ export default function App() {
 
   const handleDocumentTypeChange = (type: DocumentType) => {
     setDocumentType(type);
-    setCustomPdfImage(null);
-    setCurrentPage(0);
-    setTotalPages(type === 'template-spec' ? 2 : 1);
+    setCustomPdfPages([]);
+    setActivePageIndex(0);
+    // Her şablonda dikey akış ve sayfa listesini göstermek için varsayılan 2-3 sayfa
+    const count = type === 'template-spec' ? 2 : type === 'template-cornell' ? 3 : 2;
+    setTotalPages(count);
+    setPageThumbnails({});
     canvasActionsRef.current?.clear();
   };
 
+  // Google PDF tarzı sol sekme için sayfa listesi
+  const pages: PageInfo[] = Array.from({ length: totalPages }, (_, i) => ({
+    pageIndex: i,
+    title:
+      documentType === 'custom-pdf'
+        ? `PDF Sayfa ${i + 1}`
+        : documentType === 'template-spec'
+        ? i === 0
+          ? 'Lenovo Şartnamesi (1)'
+          : 'Donanım & Çizim (2)'
+        : documentType === 'template-cornell'
+        ? `Cornell Notları (${i + 1})`
+        : documentType === 'template-grid'
+        ? `Milimetrik Izgara (${i + 1})`
+        : `Çizgili Notlar (${i + 1})`,
+    width: 920,
+    height: 1300,
+  }));
+
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-slate-950 font-sans">
-      {/* Interactive Zero-Lag Tablet Canvas */}
+      {/* Sol Açılır Kapanır Google PDF Tarzı Sayfa Gezinti Sekmesi */}
+      <PageThumbnailSidebar
+        isOpen={isSidebarOpen}
+        onClose={() => setIsSidebarOpen(false)}
+        pages={pages}
+        activePageIndex={activePageIndex}
+        onSelectPage={(index) => {
+          setActivePageIndex(index);
+          canvasActionsRef.current?.scrollToPage(index);
+        }}
+        pageThumbnails={pageThumbnails}
+      />
+
+      {/* Dikey Alt Alta Yüklenen Sayfalar ve Çizim Tuvali */}
       <DrawingCanvas
         currentMode={currentMode}
-        strokeColor={strokeColor}
-        baseStrokeWidth={strokeWidth}
+        strokeColor={activeStrokeColor}
+        baseStrokeWidth={activeStrokeWidth}
         documentType={documentType}
-        customPdfImage={customPdfImage}
-        currentPage={currentPage}
-        totalPages={totalPages}
+        customPdfPages={customPdfPages}
+        pageCount={totalPages}
+        activePageIndex={activePageIndex}
+        onActivePageChange={setActivePageIndex}
         palmRejectionEnabled={palmRejectionEnabled}
         palmContactThreshold={palmContactThreshold}
         forceFingerMode={forceFingerMode}
@@ -128,17 +200,22 @@ export default function App() {
         }}
         onPalmEvent={handlePalmEvent}
         onStatsUpdate={setStats}
+        onThumbnailsUpdate={handleThumbnailsUpdate}
         canvasRefCallback={handleCanvasRefCallback}
       />
 
-      {/* Floating Toolbar */}
+      {/* Üstte Konumlandırılmış Araç Çubuğu */}
       <Toolbar
         currentMode={currentMode}
         onModeChange={setCurrentMode}
-        strokeColor={strokeColor}
-        onColorChange={setStrokeColor}
-        strokeWidth={strokeWidth}
-        onWidthChange={setStrokeWidth}
+        penColor={penColor}
+        onPenColorChange={setPenColor}
+        penWidth={penWidth}
+        onPenWidthChange={setPenWidth}
+        highlighterColor={highlighterColor}
+        onHighlighterColorChange={setHighlighterColor}
+        highlighterWidth={highlighterWidth}
+        onHighlighterWidthChange={setHighlighterWidth}
         canUndo={canUndo}
         canRedo={canRedo}
         onUndo={() => canvasActionsRef.current?.undo()}
@@ -146,11 +223,11 @@ export default function App() {
         onClear={() => canvasActionsRef.current?.clear()}
         onDeleteSelected={() => canvasActionsRef.current?.deleteSelected()}
         onExport={handleExport}
-        currentPage={currentPage}
+        currentPage={activePageIndex}
         totalPages={totalPages}
         onPageChange={(p) => {
-          setCurrentPage(p);
-          canvasActionsRef.current?.clear();
+          setActivePageIndex(p);
+          canvasActionsRef.current?.scrollToPage(p);
         }}
         documentType={documentType}
         onDocumentTypeChange={handleDocumentTypeChange}
@@ -159,9 +236,11 @@ export default function App() {
         onToggleSimulator={() => setIsSimulatorOpen(!isSimulatorOpen)}
         isSimulatorOpen={isSimulatorOpen}
         isCodeHubOpen={isCodeHubOpen}
+        isSidebarOpen={isSidebarOpen}
+        onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
       />
 
-      {/* Tablet Simulator Diagnostics Panel */}
+      {/* Tablet Simülatör Tanılama Paneli */}
       <TabletSimulatorPanel
         isOpen={isSimulatorOpen}
         onClose={() => setIsSimulatorOpen(false)}
@@ -176,7 +255,7 @@ export default function App() {
         onClearLogs={() => setEventLogs([])}
       />
 
-      {/* Native Android Source Code Hub Modal */}
+      {/* Yerel Android (Kotlin) Kaynak Kodu Merkezi */}
       <AndroidCodeHub isOpen={isCodeHubOpen} onClose={() => setIsCodeHubOpen(false)} />
     </div>
   );

@@ -9,7 +9,7 @@ import android.view.MotionEvent
 import android.view.View
 
 /**
- * Available annotation modes.
+ * Available annotation tools.
  */
 enum class ToolMode {
     PEN,
@@ -36,16 +36,18 @@ data class Stroke(
 )
 
 /**
- * DrawingCanvasView: High-performance, low-latency drawing canvas.
+ * DrawingCanvasView: High-performance, low-latency drawing canvas for Android tablets.
+ * Specifically tuned for Lenovo Active Pen / Lenovo Precision Pen (Wacom AES protocol).
  *
- * Engine Highlights:
- * 1. Zero Garbage Collection: Pre-allocated object pools for Path, Paint, Matrix, RectF, and Region.
- * 2. 400ms Palm Rejection Window: Rejects finger touches for 400ms following active stylus hover/touch.
- * 3. Palm Contact Area Filter: Rejects touches where AXIS_TOUCH_MAJOR > 60f (capacitive palm rest).
- * 4. High-Frequency Polling: Iterates event.historySize to capture all hardware digitizer samples between VSYNC frames.
- * 5. Bezier quadTo Interpolation: Smooth continuous vector lines without corner stepping.
- * 6. Dynamic Stylus Pressure: Modulates stroke width via MotionEvent.AXIS_PRESSURE.
- * 7. Hardware-Accelerated: Runs directly on Android's hardware-accelerated display list.
+ * Performance and Architectural Guarantees:
+ * 1. Zero Garbage Collection (0-GC): Pre-allocated object pools for Path, Paint, Matrix, RectF, and Region.
+ * 2. 400ms Palm Rejection Window: Discards capacitive finger touches for 400ms following active stylus hover/touch.
+ * 3. Contact Area Filter: Rejects capacitive touch patches with AXIS_TOUCH_MAJOR > 60f (resting palm edge).
+ * 4. High-Frequency Digitizer Polling: Iterates event.historySize to capture all hardware samples between VSYNC frames.
+ * 5. Bezier (quadTo) Interpolation: Smooth continuous vector lines without corner stepping.
+ * 6. Dynamic Pressure Sensitivity: Scales stroke width dynamically using MotionEvent.AXIS_PRESSURE.
+ * 7. Finger-Only Pan & Scroll: Finger touch NEVER draws; it only scrolls and pans the document.
+ * 8. Independent Pen & Highlighter Presets: Color and thickness for pen and highlighter are strictly isolated.
  */
 class DrawingCanvasView @JvmOverloads constructor(
     context: Context,
@@ -55,8 +57,27 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     // Active tool state
     var currentMode: ToolMode = ToolMode.PEN
-    var strokeColor: Int = Color.BLACK
-    var baseStrokeWidth: Float = 4.5f
+
+    // Pen independent color & width
+    var penColor: Int = Color.BLACK
+    var penStrokeWidth: Float = 4.5f
+
+    // Highlighter independent color & width (never overwrites pen settings)
+    var highlighterColor: Int = Color.parseColor("#FBBF24")
+    var highlighterStrokeWidth: Float = 22f
+
+    // Backward-compatibility properties
+    var strokeColor: Int
+        get() = if (currentMode == ToolMode.HIGHLIGHTER) highlighterColor else penColor
+        set(value) {
+            if (currentMode == ToolMode.HIGHLIGHTER) highlighterColor = value else penColor = value
+        }
+
+    var baseStrokeWidth: Float
+        get() = if (currentMode == ToolMode.HIGHLIGHTER) highlighterStrokeWidth else penStrokeWidth
+        set(value) {
+            if (currentMode == ToolMode.HIGHLIGHTER) highlighterStrokeWidth = value else penStrokeWidth = value
+        }
 
     // Stroke histories (Undo / Redo)
     private val strokes = ArrayList<Stroke>(128)
@@ -132,11 +153,16 @@ class DrawingCanvasView @JvmOverloads constructor(
     private var lastY = 0f
     private var isDrawing = false
 
-    // Palm Rejection state
+    // Palm Rejection & Finger Scrolling state
     private var lastStylusTimestamp = 0L
     private val STYLUS_HOVER_TOUCH_COOLDOWN_MS = 400L
     private val PALM_TOUCH_MAJOR_THRESHOLD = 60f
     private val TOUCH_SLOP = 1.5f
+
+    // Finger pan/scroll state using raw screen coordinates to prevent jitter
+    private var fingerRawStartX = 0f
+    private var fingerRawStartY = 0f
+    private var isFingerScrolling = false
 
     // Optional background PDF Bitmap
     var pdfBackground: Bitmap? = null
@@ -148,6 +174,7 @@ class DrawingCanvasView @JvmOverloads constructor(
     // Callbacks for UI updates
     var onHistoryChanged: ((canUndo: Boolean, canRedo: Boolean) -> Unit)? = null
     var onStrokeAdded: (() -> Unit)? = null
+    var onFingerScrollActive: ((isScrolling: Boolean) -> Unit)? = null
 
     init {
         // Enforce hardware acceleration layer
@@ -156,8 +183,8 @@ class DrawingCanvasView @JvmOverloads constructor(
     }
 
     /**
-     * Intercepts stylus hover events (Lenovo Precision Pen hover above screen).
-     * Updates stylus timestamp to reject palm touches before the pen even makes contact!
+     * Intercepts stylus hover events (Lenovo Precision Pen hovering above the digitizer).
+     * Pre-arms the palm rejection window before the pen tip touches the glass!
      */
     override fun onHoverEvent(event: MotionEvent): Boolean {
         val toolType = event.getToolType(0)
@@ -168,7 +195,7 @@ class DrawingCanvasView @JvmOverloads constructor(
     }
 
     /**
-     * Main input handler with hardware historical point processing and palm rejection.
+     * Main input handler with sub-frame historical sample processing and palm rejection.
      */
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -176,33 +203,60 @@ class DrawingCanvasView @JvmOverloads constructor(
         val isStylus = toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER
         val now = SystemClock.uptimeMillis()
 
+        // Content coordinate mapping taking current scroll position into account
+        val x = event.x + scrollX
+        val y = event.y + scrollY
+
         // -------------------------------------------------------------
-        // PALM REJECTION PIPELINE
+        // PALM REJECTION PIPELINE & FINGER TOUCH HANDLING
         // -------------------------------------------------------------
         if (isStylus) {
             lastStylusTimestamp = now
         } else {
-            // 1. Hover/Touch window cooldown rejection: Reject finger if stylus was used in last 400ms
+            // 1. Cooldown rejection: Reject finger if stylus was active within 400ms
             if (now - lastStylusTimestamp < STYLUS_HOVER_TOUCH_COOLDOWN_MS) {
                 return true // Consume and discard accidental palm touch
             }
 
-            // 2. Contact area filter: Reject large capacitive patches (resting palm side)
+            // 2. Contact area filter: Reject large capacitive patches (resting side of hand)
             val touchMajor = event.getTouchMajor(0)
             if (touchMajor > PALM_TOUCH_MAJOR_THRESHOLD) {
                 return true // Consume and discard palm rest
             }
+
+            // 3. Kalem yokken parmakla yazma engeli: Parmak asla çizim yapmaz, sadece sayfayı kaydırır
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    fingerRawStartX = event.rawX
+                    fingerRawStartY = event.rawY
+                    isFingerScrolling = true
+                    onFingerScrollActive?.invoke(true)
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (isFingerScrolling) {
+                        val dx = event.rawX - fingerRawStartX
+                        val dy = event.rawY - fingerRawStartY
+                        fingerRawStartX = event.rawX
+                        fingerRawStartY = event.rawY
+
+                        // Scroll the view smoothly
+                        scrollBy((-dx).toInt(), (-dy).toInt())
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    isFingerScrolling = false
+                    onFingerScrollActive?.invoke(false)
+                }
+            }
+            return true
         }
 
-        // Hardware Eraser Button on stylus (Precision Pen barrel button)
+        // Hardware Eraser Button on stylus barrel
         val activeTool = if (toolType == MotionEvent.TOOL_TYPE_ERASER) {
             ToolMode.ERASER_STROKE
         } else {
             currentMode
         }
-
-        val x = event.x
-        val y = event.y
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -265,8 +319,8 @@ class DrawingCanvasView @JvmOverloads constructor(
                 // -------------------------------------------------------------
                 val historySize = event.historySize
                 for (h in 0 until historySize) {
-                    val hx = event.getHistoricalX(h)
-                    val hy = event.getHistoricalY(h)
+                    val hx = event.getHistoricalX(h) + scrollX
+                    val hy = event.getHistoricalY(h) + scrollY
                     val hp = event.getHistoricalPressure(h)
                     appendBezierSample(hx, hy, hp, activeTool)
                 }
@@ -295,15 +349,16 @@ class DrawingCanvasView @JvmOverloads constructor(
                         // Finished erasing gesture
                     }
                     else -> {
-                        // Commit active vector stroke
+                        // Commit active vector stroke with tool-specific independent color and width
                         val committedPath = Path(activePath)
                         val isHighlighter = activeTool == ToolMode.HIGHLIGHTER
                         val alpha = if (isHighlighter) 115 else 255
                         val width = activePaint.strokeWidth
+                        val chosenColor = if (isHighlighter) highlighterColor else penColor
 
                         val stroke = Stroke(
                             path = committedPath,
-                            color = strokeColor,
+                            color = chosenColor,
                             strokeWidth = width,
                             alpha = alpha,
                             isHighlighter = isHighlighter
@@ -345,7 +400,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             if (tool == ToolMode.PEN) {
                 val clampedPressure = pressure.coerceIn(0.05f, 1.0f)
                 val pressureMultiplier = 0.5f + (clampedPressure * 1.5f)
-                activePaint.strokeWidth = baseStrokeWidth * pressureMultiplier
+                activePaint.strokeWidth = penStrokeWidth * pressureMultiplier
             }
         }
     }
@@ -360,16 +415,16 @@ class DrawingCanvasView @JvmOverloads constructor(
 
         when (tool) {
             ToolMode.PEN -> {
-                activePaint.color = strokeColor
+                activePaint.color = penColor
                 activePaint.alpha = 255
                 activePaint.xfermode = null
                 val clampedPressure = pressure.coerceIn(0.05f, 1.0f)
-                activePaint.strokeWidth = baseStrokeWidth * (0.5f + (clampedPressure * 1.5f))
+                activePaint.strokeWidth = penStrokeWidth * (0.5f + (clampedPressure * 1.5f))
             }
             ToolMode.HIGHLIGHTER -> {
-                activePaint.color = strokeColor
+                activePaint.color = highlighterColor
                 activePaint.alpha = 115
-                activePaint.strokeWidth = baseStrokeWidth * 3.8f
+                activePaint.strokeWidth = highlighterStrokeWidth
                 activePaint.xfermode = highlighterXfermode
             }
             ToolMode.LASSO -> {
@@ -428,8 +483,9 @@ class DrawingCanvasView @JvmOverloads constructor(
             )
             strokeRegion.setPath(stroke.path, clipRegion)
 
-            // Check if lasso region encompasses or intersects stroke region
-            if (!lassoRegion.op(strokeRegion, Region.Op.INTERSECT)) {
+            // Correct intersection check: if region.op returns true, they DO intersect
+            val intersects = lassoRegion.op(strokeRegion, Region.Op.INTERSECT)
+            if (intersects) {
                 stroke.isSelected = true
                 selectedStrokes.add(stroke)
                 if (selectionBounds.isEmpty) {
@@ -514,19 +570,72 @@ class DrawingCanvasView @JvmOverloads constructor(
         invalidate()
     }
 
+    /**
+     * Returns a safe snapshot of current strokes for per-page caching.
+     */
+    fun getStrokesCopy(): List<Stroke> = ArrayList(strokes)
+
+    /**
+     * Restores strokes for a given page index.
+     */
+    fun setStrokes(newStrokes: List<Stroke>) {
+        strokes.clear()
+        strokes.addAll(newStrokes)
+        undoStack.clear()
+        clearSelection()
+        notifyHistoryState()
+        invalidate()
+    }
+
     private fun notifyHistoryState() {
         onHistoryChanged?.invoke(strokes.isNotEmpty(), undoStack.isNotEmpty())
     }
 
     /**
-     * Exports current canvas bitmap (with PDF background and all vector strokes) for saving.
+     * Exports full-resolution flattened bitmap (PDF background + vector strokes) for saving.
+     * Content is rendered in un-scrolled page coordinates.
      */
     fun createFlattenedBitmap(): Bitmap {
-        val w = width.coerceAtLeast(1)
-        val h = height.coerceAtLeast(1)
+        val w = (pdfBackground?.width ?: width).coerceAtLeast(1)
+        val h = (pdfBackground?.height ?: height).coerceAtLeast(1)
         val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
-        draw(canvas)
+        canvas.drawColor(Color.WHITE)
+
+        // Draw background
+        pdfBackground?.let { bg ->
+            if (!bg.isRecycled) {
+                canvas.drawBitmap(bg, 0f, 0f, null)
+            }
+        }
+
+        // Draw committed strokes
+        for (i in 0 until strokes.size) {
+            val stroke = strokes[i]
+            cachedRenderPaint.reset()
+            cachedRenderPaint.isAntiAlias = true
+            cachedRenderPaint.isDither = true
+            cachedRenderPaint.style = Paint.Style.STROKE
+            cachedRenderPaint.strokeJoin = Paint.Join.ROUND
+            cachedRenderPaint.strokeCap = Paint.Cap.ROUND
+            cachedRenderPaint.color = stroke.color
+            cachedRenderPaint.alpha = stroke.alpha
+            cachedRenderPaint.strokeWidth = stroke.strokeWidth
+
+            if (stroke.isHighlighter) {
+                cachedRenderPaint.xfermode = highlighterXfermode
+            }
+
+            if (stroke.offsetX != 0f || stroke.offsetY != 0f) {
+                val saveCount = canvas.save()
+                canvas.translate(stroke.offsetX, stroke.offsetY)
+                canvas.drawPath(stroke.path, cachedRenderPaint)
+                canvas.restoreToCount(saveCount)
+            } else {
+                canvas.drawPath(stroke.path, cachedRenderPaint)
+            }
+        }
+
         return bitmap
     }
 
@@ -580,7 +689,6 @@ class DrawingCanvasView @JvmOverloads constructor(
         // 4. Draw Lasso Selection Overlay & Handles
         if (selectedStrokes.isNotEmpty() && !selectionBounds.isEmpty) {
             canvas.drawRect(selectionBounds, selectionBoundingPaint)
-            // Draw four corner drag handles
             val handleRadius = 10f
             drawHandle(canvas, selectionBounds.left, selectionBounds.top, handleRadius)
             drawHandle(canvas, selectionBounds.right, selectionBounds.top, handleRadius)

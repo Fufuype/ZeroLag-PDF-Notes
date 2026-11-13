@@ -8,6 +8,7 @@ import {
   isPointInPolygon,
   isStrokeSelectedByLasso,
   shouldRejectPalmEvent,
+  determinePointerAction,
 } from './strokeMath';
 
 test('calculatePressureWidth scales base stroke width proportionally with stylus pressure', () => {
@@ -133,4 +134,18 @@ test('shouldRejectPalmEvent enforces 400ms stylus window and contact area thresh
   });
   assert.equal(palmRest.reject, true);
   assert.equal(palmRest.reason, 'LARGE_CONTACT_AREA');
+});
+
+test('determinePointerAction enforces stylus-only drawing and finger-only scrolling', () => {
+  // Physical active pen must always DRAW
+  assert.equal(determinePointerAction('pen', false), 'DRAW');
+  assert.equal(determinePointerAction('pen', true), 'DRAW');
+
+  // Finger touch must always SCROLL (no drawing without pen!)
+  assert.equal(determinePointerAction('touch', false), 'SCROLL');
+  assert.equal(determinePointerAction('touch', true), 'SCROLL');
+
+  // Mouse configured as stylus simulation draws, or scrolls when toggled
+  assert.equal(determinePointerAction('mouse', true), 'DRAW');
+  assert.equal(determinePointerAction('mouse', false), 'SCROLL');
 });

@@ -21,6 +21,14 @@ export interface StrokeData {
 
 export type DocumentType = 'template-spec' | 'template-cornell' | 'template-grid' | 'template-lined' | 'custom-pdf';
 
+export interface PageInfo {
+  pageIndex: number;
+  title: string;
+  width: number;
+  height: number;
+  customImage?: HTMLImageElement;
+}
+
 export interface AndroidFile {
   name: string;
   path: string;

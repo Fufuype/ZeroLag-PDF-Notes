@@ -188,3 +188,25 @@ export function shouldRejectPalmEvent(params: {
 
   return { reject: false };
 }
+
+/**
+ * Determines whether a pointer event should write/annotate or scroll/pan the document.
+ * Per the requirement:
+ * - Active stylus ('pen') -> Always 'DRAW' (write, highlight, erase, lasso).
+ * - Finger ('touch') -> Never draw! Always 'SCROLL' (drag/pan the pages).
+ * - Mouse ('mouse') -> Configurable via isStylusSimulated (default true for desktop stylus simulation).
+ */
+export function determinePointerAction(
+  pointerType: string,
+  isStylusSimulated: boolean = true
+): 'DRAW' | 'SCROLL' {
+  if (pointerType === 'pen') {
+    return 'DRAW';
+  }
+  if (pointerType === 'touch') {
+    return 'SCROLL';
+  }
+  // For desktop mouse
+  return isStylusSimulated ? 'DRAW' : 'SCROLL';
+}
+

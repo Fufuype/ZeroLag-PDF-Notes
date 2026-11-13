@@ -19,15 +19,22 @@ import {
   Palette,
   FileText,
   Check,
+  PanelLeft,
 } from 'lucide-react';
 
 interface ToolbarProps {
   currentMode: ToolMode;
   onModeChange: (mode: ToolMode) => void;
-  strokeColor: string;
-  onColorChange: (color: string) => void;
-  strokeWidth: number;
-  onWidthChange: (width: number) => void;
+  // Kalem bağımsız renk ve kalınlığı
+  penColor: string;
+  onPenColorChange: (color: string) => void;
+  penWidth: number;
+  onPenWidthChange: (width: number) => void;
+  // Vurgulayıcı bağımsız renk ve kalınlığı (asla kalemi etkilemez)
+  highlighterColor: string;
+  onHighlighterColorChange: (color: string) => void;
+  highlighterWidth: number;
+  onHighlighterWidthChange: (width: number) => void;
   canUndo: boolean;
   canRedo: boolean;
   onUndo: () => void;
@@ -45,9 +52,11 @@ interface ToolbarProps {
   onToggleSimulator: () => void;
   isSimulatorOpen: boolean;
   isCodeHubOpen: boolean;
+  isSidebarOpen: boolean;
+  onToggleSidebar: () => void;
 }
 
-// En az 10 farklı belirgin renk seçeneği (12 adet canlı ve ayırt edilebilir renk)
+// Kalem için 12 adet canlı ve ayırt edilebilir renk
 export const PALETTE_COLORS = [
   { hex: '#000000', name: 'Siyah' },
   { hex: '#1E3A8A', name: 'Gece Mavisi' },
@@ -63,29 +72,47 @@ export const PALETTE_COLORS = [
   { hex: '#78350F', name: 'Sıcak Kahverengi' },
 ];
 
+// Vurgulayıcı için 12 adet yarı şeffaf fosforlu ve pastel renk
 export const HIGHLIGHTER_COLORS = [
   { hex: '#FBBF24', name: 'Fosforlu Sarı' },
-  { hex: '#4ADE80', name: 'Açık Yeşil' },
-  { hex: '#F472B6', name: 'Pastel Pembe' },
-  { hex: '#60A5FA', name: 'Bebek Mavisi' },
+  { hex: '#FACC15', name: 'Parlak Limon' },
+  { hex: '#22C55E', name: 'Fosforlu Yeşil' },
+  { hex: '#4ADE80', name: 'Pastel Nane' },
+  { hex: '#06B6D4', name: 'Canlı Turkuaz' },
+  { hex: '#38BDF8', name: 'Bebek Mavisi' },
+  { hex: '#60A5FA', name: 'Gök Mavisi' },
+  { hex: '#A855F7', name: 'Canlı Lila' },
   { hex: '#C084FC', name: 'Lavanta Moru' },
-  { hex: '#FDBA74', name: 'Açık Şeftali' },
+  { hex: '#F472B6', name: 'Pastel Pembe' },
+  { hex: '#FB7185', name: 'Gül Pembesi' },
+  { hex: '#FB923C', name: 'Açık Şeftali' },
 ];
 
-const STROKE_SIZES = [
+export const PEN_STROKE_SIZES = [
   { size: 2, label: 'İnce (2px)' },
   { size: 4, label: 'Normal (4px)' },
-  { size: 8, label: 'Kalın (8px)' },
-  { size: 14, label: 'Geniş (14px)' },
+  { size: 6, label: 'Orta (6px)' },
+  { size: 10, label: 'Kalın (10px)' },
+];
+
+export const HIGHLIGHTER_STROKE_SIZES = [
+  { size: 8, label: 'İnce (8px)' },
+  { size: 14, label: 'Normal (14px)' },
+  { size: 22, label: 'Geniş (22px)' },
+  { size: 32, label: 'Ekstra (32px)' },
 ];
 
 export const Toolbar: React.FC<ToolbarProps> = ({
   currentMode,
   onModeChange,
-  strokeColor,
-  onColorChange,
-  strokeWidth,
-  onWidthChange,
+  penColor,
+  onPenColorChange,
+  penWidth,
+  onPenWidthChange,
+  highlighterColor,
+  onHighlighterColorChange,
+  highlighterWidth,
+  onHighlighterWidthChange,
   canUndo,
   canRedo,
   onUndo,
@@ -103,6 +130,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   onToggleSimulator,
   isSimulatorOpen,
   isCodeHubOpen,
+  isSidebarOpen,
+  onToggleSidebar,
 }) => {
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [showColorPicker, setShowColorPicker] = useState(false);
@@ -117,7 +146,11 @@ export const Toolbar: React.FC<ToolbarProps> = ({
     }
   };
 
-  const activePalette = currentMode === 'highlighter' ? HIGHLIGHTER_COLORS : PALETTE_COLORS;
+  const isHighlighter = currentMode === 'highlighter';
+  const activeStrokeColor = isHighlighter ? highlighterColor : penColor;
+  const activeStrokeWidth = isHighlighter ? highlighterWidth : penWidth;
+  const activePalette = isHighlighter ? HIGHLIGHTER_COLORS : PALETTE_COLORS;
+  const activeSizes = isHighlighter ? HIGHLIGHTER_STROKE_SIZES : PEN_STROKE_SIZES;
 
   return (
     <>
@@ -146,9 +179,28 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
       {/* ÜST BÖLÜM: BİRLEŞİK, ÇAKIŞMAYAN ÜST TABLET ÇUBUĞU */}
       {!isCollapsed && (
-        <div className="absolute top-3 inset-x-3 z-30 flex items-center justify-between gap-3 pointer-events-none">
-          {/* 1. SOL KÜME: BELGE VE ŞABLON SEÇİCİ & SAYFA GEZİNTİSİ */}
+        <div
+          className={`absolute top-3 right-3 z-30 flex items-center justify-between gap-3 pointer-events-none transition-all duration-200 ${
+            isSidebarOpen ? 'left-68 md:left-76' : 'left-3'
+          }`}
+        >
+          {/* 1. SOL KÜME: SAYFA GEZİNTİ ÇUBUĞU & BELGE SEÇİCİ & SAYFALAR */}
           <div className="flex items-center gap-2 pointer-events-auto shrink-0">
+            {/* Google PDF Tarzı Sayfa Gezinti Sekmesi Aç/Kapa Butonu */}
+            <button
+              onClick={onToggleSidebar}
+              className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border shadow-xl backdrop-blur-xl transition text-xs font-semibold ${
+                isSidebarOpen
+                  ? 'bg-blue-600/30 border-blue-500/80 text-blue-300 ring-2 ring-blue-500/20'
+                  : 'bg-slate-900/95 hover:bg-slate-800 border-slate-700/90 text-slate-200'
+              }`}
+              title={isSidebarOpen ? 'Sol Sayfa Gezinti Sekmesini Kapat' : 'Sol Sayfa Gezinti Sekmesini Aç'}
+              aria-label="Sayfalar Gezinti Sekmesi"
+            >
+              <PanelLeft className="w-4 h-4 text-blue-400" />
+              <span className="hidden sm:inline">Sayfalar</span>
+            </button>
+
             {/* Şablon Seçici Buton */}
             <div className="relative">
               <button
@@ -271,7 +323,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           <div className="relative pointer-events-auto flex flex-col items-center shrink-0">
             {/* Ana Araç Çubuğu */}
             <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-2xl bg-slate-900/98 border border-slate-700/90 shadow-2xl backdrop-blur-xl">
-              {/* Kalem */}
+              {/* Kalem (Bağımsız Renk ve Kalınlık) */}
               <button
                 onClick={() => onModeChange('pen')}
                 className={`p-2 rounded-xl transition flex items-center gap-1.5 ${
@@ -279,31 +331,34 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                     ? 'bg-blue-600 text-white shadow-lg shadow-blue-500/25 font-bold'
                     : 'text-slate-300 hover:text-white hover:bg-slate-800'
                 }`}
-                title="Kalem (Aktif Kalem Basınç Duyarlılığı)"
+                title={`Kalem (${PALETTE_COLORS.find((c) => c.hex.toLowerCase() === penColor.toLowerCase())?.name || penColor})`}
                 aria-label="Kalem"
               >
                 <Pen className="w-4 h-4" />
                 <span className="text-xs hidden sm:inline">Kalem</span>
+                <span
+                  className="w-2.5 h-2.5 rounded-full border border-white/60 shadow-sm shrink-0"
+                  style={{ backgroundColor: penColor }}
+                />
               </button>
 
-              {/* Vurgulayıcı */}
+              {/* Vurgulayıcı (Bağımsız Renk ve Kalınlık - Kalemi Asla Etkilemez) */}
               <button
-                onClick={() => {
-                  onModeChange('highlighter');
-                  if (!HIGHLIGHTER_COLORS.some((c) => c.hex === strokeColor)) {
-                    onColorChange('#FBBF24');
-                  }
-                }}
+                onClick={() => onModeChange('highlighter')}
                 className={`p-2 rounded-xl transition flex items-center gap-1.5 ${
                   currentMode === 'highlighter'
                     ? 'bg-amber-500 text-slate-950 font-bold shadow-lg shadow-amber-500/25'
                     : 'text-slate-300 hover:text-white hover:bg-slate-800'
                 }`}
-                title="Vurgulayıcı (Metni Kapatmayan Çarpma Karışım Modu)"
+                title={`Vurgulayıcı (${HIGHLIGHTER_COLORS.find((c) => c.hex.toLowerCase() === highlighterColor.toLowerCase())?.name || highlighterColor})`}
                 aria-label="Vurgulayıcı"
               >
                 <Highlighter className="w-4 h-4" />
                 <span className="text-xs hidden sm:inline">Vurgulayıcı</span>
+                <span
+                  className="w-2.5 h-2.5 rounded-full border border-slate-900/40 shadow-sm shrink-0"
+                  style={{ backgroundColor: highlighterColor }}
+                />
               </button>
 
               {/* Silgi */}
@@ -338,7 +393,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
               <div className="w-px h-5 bg-slate-800 mx-0.5" />
 
-              {/* Renk Paleti Tetikleyici Butonu */}
+              {/* Renk Paleti Tetikleyici Butonu (Aktif Aracın Rengi ve Kalınlığı) */}
               <button
                 onClick={() => setShowColorPicker(!showColorPicker)}
                 className={`p-1.5 px-2.5 rounded-xl border transition flex items-center gap-2 ${
@@ -346,14 +401,14 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                     ? 'bg-slate-800 border-blue-500 text-white ring-2 ring-blue-500/30'
                     : 'bg-slate-800/80 border-slate-700 text-slate-300 hover:bg-slate-800 hover:text-white'
                 }`}
-                title="Renk Paleti (12 Renk) ve Çizgi Kalınlığı"
+                title={isHighlighter ? 'Vurgulayıcı Rengi (12 Renk) ve Genişliği' : 'Kalem Rengi (12 Renk) ve Kalınlığı'}
                 aria-label="Renk Paleti"
               >
                 <div
                   className="w-4 h-4 rounded-full border-2 border-white shadow-sm ring-1 ring-slate-900"
-                  style={{ backgroundColor: strokeColor }}
+                  style={{ backgroundColor: activeStrokeColor }}
                 />
-                <span className="text-[11px] font-mono font-semibold hidden md:inline">{strokeWidth}px</span>
+                <span className="text-[11px] font-mono font-semibold hidden md:inline">{activeStrokeWidth}px</span>
                 <Palette className="w-3.5 h-3.5 text-slate-400" />
               </button>
 
@@ -417,25 +472,66 @@ export const Toolbar: React.FC<ToolbarProps> = ({
               </button>
             </div>
 
-            {/* AÇILIR RENK PALETİ (EN AZ 10 FARKLI BELİRGİN RENK VE KALINLIK) */}
+            {/* AÇILIR RENK PALETİ (KALEM VE VURGULAYICI İÇİN TAMAMEN AYRI VE BAĞIMSIZ) */}
             {showColorPicker && (
               <div className="mt-2.5 px-5 py-3.5 rounded-2xl bg-slate-900/98 border border-slate-700 shadow-2xl backdrop-blur-2xl flex flex-col gap-3 animate-in fade-in slide-in-from-top-2 duration-150 z-50">
+                {/* Araç Seçim Sekmesi (Kalem vs Vurgulayıcı Ayırımı) */}
+                <div className="flex items-center gap-1.5 p-1 rounded-xl bg-slate-800/80 border border-slate-700/80">
+                  <button
+                    onClick={() => onModeChange('pen')}
+                    className={`flex-1 flex items-center justify-center gap-2 py-1.5 px-3 rounded-lg text-xs font-semibold transition ${
+                      !isHighlighter
+                        ? 'bg-blue-600 text-white shadow-md'
+                        : 'text-slate-400 hover:text-white hover:bg-slate-700/50'
+                    }`}
+                  >
+                    <Pen className="w-3.5 h-3.5" />
+                    <span>Kalem Rengi</span>
+                    <span
+                      className="w-2.5 h-2.5 rounded-full border border-white/60 shadow-sm shrink-0"
+                      style={{ backgroundColor: penColor }}
+                    />
+                  </button>
+
+                  <button
+                    onClick={() => onModeChange('highlighter')}
+                    className={`flex-1 flex items-center justify-center gap-2 py-1.5 px-3 rounded-lg text-xs font-semibold transition ${
+                      isHighlighter
+                        ? 'bg-amber-500 text-slate-950 font-bold shadow-md'
+                        : 'text-slate-400 hover:text-white hover:bg-slate-700/50'
+                    }`}
+                  >
+                    <Highlighter className="w-3.5 h-3.5" />
+                    <span>Vurgulayıcı Rengi</span>
+                    <span
+                      className="w-2.5 h-2.5 rounded-full border border-slate-900/40 shadow-sm shrink-0"
+                      style={{ backgroundColor: highlighterColor }}
+                    />
+                  </button>
+                </div>
+
                 <div>
                   <div className="flex items-center justify-between text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">
-                    <span>Renk Paleti ({activePalette.length} Canlı Renk)</span>
+                    <span>
+                      {isHighlighter ? 'Vurgulayıcı Rengi (12 Fosforlu Renk)' : 'Kalem Rengi (12 Canlı Renk)'}
+                    </span>
                     <span className="text-[10px] text-blue-400 font-mono font-bold">
-                      {activePalette.find((c) => c.hex.toLowerCase() === strokeColor.toLowerCase())?.name || strokeColor}
+                      {activePalette.find((c) => c.hex.toLowerCase() === activeStrokeColor.toLowerCase())?.name || activeStrokeColor}
                     </span>
                   </div>
 
                   <div className="grid grid-cols-6 sm:grid-cols-12 gap-2">
                     {activePalette.map((colorItem) => {
-                      const isSelected = strokeColor.toLowerCase() === colorItem.hex.toLowerCase();
+                      const isSelected = activeStrokeColor.toLowerCase() === colorItem.hex.toLowerCase();
                       return (
                         <button
                           key={colorItem.hex}
                           onClick={() => {
-                            onColorChange(colorItem.hex);
+                            if (isHighlighter) {
+                              onHighlighterColorChange(colorItem.hex);
+                            } else {
+                              onPenColorChange(colorItem.hex);
+                            }
                             setShowColorPicker(false);
                           }}
                           className={`group relative w-7 h-7 rounded-full flex items-center justify-center transition-all ${
@@ -450,7 +546,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                           {isSelected && (
                             <Check
                               className={`w-3.5 h-3.5 ${
-                                ['#fbbf24', '#4ade80', '#60a5fa', '#f59e0b'].includes(colorItem.hex.toLowerCase())
+                                ['#fbbf24', '#facc15', '#4ade80', '#60a5fa', '#f59e0b'].includes(colorItem.hex.toLowerCase())
                                   ? 'text-slate-950'
                                   : 'text-white'
                               }`}
@@ -462,17 +558,27 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                   </div>
                 </div>
 
-                {/* Çizgi Kalınlığı */}
+                {/* Çizgi Kalınlığı (Aktif Araca Özel) */}
                 <div className="pt-2 border-t border-slate-800 flex items-center justify-between gap-3">
-                  <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Kalınlık</span>
+                  <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                    {isHighlighter ? 'Vurgulayıcı Kalınlığı' : 'Kalem Kalınlığı'}
+                  </span>
                   <div className="flex items-center gap-1.5">
-                    {STROKE_SIZES.map((sz) => (
+                    {activeSizes.map((sz) => (
                       <button
                         key={sz.size}
-                        onClick={() => onWidthChange(sz.size)}
+                        onClick={() => {
+                          if (isHighlighter) {
+                            onHighlighterWidthChange(sz.size);
+                          } else {
+                            onPenWidthChange(sz.size);
+                          }
+                        }}
                         className={`px-3 py-1 rounded-lg text-xs font-semibold transition ${
-                          strokeWidth === sz.size
-                            ? 'bg-blue-600 text-white shadow-md'
+                          activeStrokeWidth === sz.size
+                            ? isHighlighter
+                              ? 'bg-amber-500 text-slate-950 font-bold shadow-md'
+                              : 'bg-blue-600 text-white shadow-md'
                             : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
                         }`}
                       >

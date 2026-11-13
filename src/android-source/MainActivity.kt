@@ -1,7 +1,11 @@
 package com.zerolag.pdfnotes
 
 import android.content.ContentValues
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color as AndroidColor
+import android.graphics.Paint
+import android.graphics.Path
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -17,6 +21,9 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -29,27 +36,41 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.OutputStream
 
 /**
- * MainActivity: Lightweight Jetpack Compose entry point.
- * Hosts the hardware-accelerated DrawingCanvasView and auto-hiding floating toolbar.
+ * MainActivity: Ultra-lightweight Jetpack Compose entry point.
+ * Hosts the hardware-accelerated DrawingCanvasView, collapsible Google-PDF style left thumbnail drawer,
+ * and top-anchored floating annotation toolbar.
  *
- * Designed for Lenovo Tab M8/M10, Tab P11 with Active Pen/Precision Pen.
+ * Optimized specifically for low-end tablets (Lenovo Tab M8/M10, Tab P11) with Active Pen/Precision Pen.
  */
 class MainActivity : ComponentActivity() {
 
     private lateinit var pdfEngine: PdfRenderEngine
     private var canvasView: DrawingCanvasView? = null
 
-    // SAF File Picker
+    // Per-page stroke cache (Page index -> List of drawn strokes)
+    private val pageAnnotations = mutableMapOf<Int, List<Stroke>>()
+
+    // Storage Access Framework Launchers
     private val openPdfLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         uri?.let { loadPdfDocument(it) }
+    }
+
+    private val exportPdfLauncher = registerForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri: Uri? ->
+        uri?.let { exportAnnotatedPdfToUri(it) }
     }
 
     // State holders
@@ -58,6 +79,11 @@ class MainActivity : ComponentActivity() {
     private var currentPageIndex by mutableIntStateOf(0)
     private var canUndo by mutableStateOf(false)
     private var canRedo by mutableStateOf(false)
+    private var isSidebarOpen by mutableStateOf(false)
+    private var isExporting by mutableStateOf(false)
+
+    // Thumbnail cache for left sidebar
+    private val pageThumbnails = mutableStateMapOf<Int, Bitmap>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,13 +104,20 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun MainScreen() {
+        val coroutineScope = rememberCoroutineScope()
         var activeTool by remember { mutableStateOf(ToolMode.PEN) }
-        var activeColor by remember { mutableStateOf(AndroidColor.BLACK) }
-        var activeWidth by remember { mutableFloatStateOf(4.5f) }
+        var penColor by remember { mutableIntStateOf(AndroidColor.BLACK) }
+        var penWidth by remember { mutableFloatStateOf(4.5f) }
+        var highlighterColor by remember { mutableIntStateOf(AndroidColor.parseColor("#FBBF24")) }
+        var highlighterWidth by remember { mutableFloatStateOf(24f) }
+
         var isToolbarVisible by remember { mutableStateOf(true) }
         var showColorPicker by remember { mutableStateOf(false) }
+        var showExportDialog by remember { mutableStateOf(false) }
 
-        val paletteColors = remember {
+        val activeColor = if (activeTool == ToolMode.HIGHLIGHTER) highlighterColor else penColor
+
+        val penPaletteColors = remember {
             listOf(
                 AndroidColor.BLACK,
                 AndroidColor.parseColor("#1E3A8A"), // Koyu Gece Mavisi
@@ -101,6 +134,25 @@ class MainActivity : ComponentActivity() {
             )
         }
 
+        val highlighterPaletteColors = remember {
+            listOf(
+                AndroidColor.parseColor("#FBBF24"), // Fosforlu Sarı
+                AndroidColor.parseColor("#FACC15"), // Parlak Limon
+                AndroidColor.parseColor("#22C55E"), // Fosforlu Yeşil
+                AndroidColor.parseColor("#4ADE80"), // Pastel Nane
+                AndroidColor.parseColor("#06B6D4"), // Canlı Turkuaz
+                AndroidColor.parseColor("#38BDF8"), // Bebek Mavisi
+                AndroidColor.parseColor("#60A5FA"), // Gök Mavisi
+                AndroidColor.parseColor("#A855F7"), // Canlı Lila
+                AndroidColor.parseColor("#C084FC"), // Lavanta Moru
+                AndroidColor.parseColor("#F472B6"), // Pastel Pembe
+                AndroidColor.parseColor("#FB7185"), // Gül Pembesi
+                AndroidColor.parseColor("#FB923C"), // Açık Şeftali
+            )
+        }
+
+        val currentPalette = if (activeTool == ToolMode.HIGHLIGHTER) highlighterPaletteColors else penPaletteColors
+
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -112,8 +164,10 @@ class MainActivity : ComponentActivity() {
                     DrawingCanvasView(context).also { view ->
                         canvasView = view
                         view.currentMode = activeTool
-                        view.strokeColor = activeColor
-                        view.baseStrokeWidth = activeWidth
+                        view.penColor = penColor
+                        view.penStrokeWidth = penWidth
+                        view.highlighterColor = highlighterColor
+                        view.highlighterStrokeWidth = highlighterWidth
                         view.onHistoryChanged = { undoable, redoable ->
                             canUndo = undoable
                             canRedo = redoable
@@ -123,32 +177,170 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier.fillMaxSize()
             )
 
-            // 2. Sayfa Gezinme Göstergesi (Sol Üst)
+            // 2. Sol Açılır/Kapanır Sayfa Gezinme Çekmecesi (Google PDF Stili Küçük Resimler)
+            AnimatedVisibility(
+                visible = isSidebarOpen && totalPages > 0,
+                enter = slideInHorizontally(initialOffsetX = { -it }) + fadeIn(),
+                exit = slideOutHorizontally(targetOffsetY = { 0 }, targetOffsetX = { -it }) + fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .fillMaxHeight()
+                    .width(180.dp)
+                    .zIndex(10f)
+            ) {
+                Surface(
+                    color = Color(0xF21E1E24),
+                    shadowElevation = 16.dp,
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .border(width = 1.dp, color = Color(0x33FFFFFF), shape = RoundedCornerShape(topEnd = 16.dp, bottomEnd = 16.dp))
+                ) {
+                    Column(modifier = Modifier.fillMaxSize().padding(8.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp)
+                        ) {
+                            Text(
+                                text = "Sayfalar ($totalPages)",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = Color.White
+                            )
+                            IconButton(
+                                onClick = { isSidebarOpen = false },
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = "Kapat", tint = Color.LightGray)
+                            }
+                        }
+
+                        val listState = rememberLazyListState()
+                        LazyColumn(
+                            state = listState,
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.fillMaxSize()
+                        ) {
+                            items(totalPages) { pageIdx ->
+                                val isSelected = pageIdx == currentPageIndex
+                                val thumbnail = pageThumbnails[pageIdx]
+                                val hasNotes = pageAnnotations[pageIdx]?.isNotEmpty() == true
+
+                                Card(
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = if (isSelected) Color(0xFF2563EB).copy(alpha = 0.25f) else Color(0xFF2A2A32)
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .border(
+                                            width = if (isSelected) 2.dp else 1.dp,
+                                            color = if (isSelected) Color(0xFF3B82F6) else Color(0x22FFFFFF),
+                                            shape = RoundedCornerShape(10.dp)
+                                        )
+                                        .clickable {
+                                            switchPage(pageIdx)
+                                        }
+                                ) {
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        modifier = Modifier.padding(6.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(130.dp)
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .background(Color.White),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            if (thumbnail != null) {
+                                                androidx.compose.foundation.Image(
+                                                    bitmap = thumbnail.asImageBitmap(),
+                                                    contentDescription = "Sayfa ${pageIdx + 1}",
+                                                    modifier = Modifier.fillMaxSize()
+                                                )
+                                            } else {
+                                                CircularProgressIndicator(
+                                                    modifier = Modifier.size(20.dp),
+                                                    strokeWidth = 2.dp,
+                                                    color = Color.Gray
+                                                )
+                                            }
+
+                                            if (hasNotes) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .align(Alignment.TopEnd)
+                                                        .padding(4.dp)
+                                                        .size(18.dp)
+                                                        .clip(CircleShape)
+                                                        .background(Color(0xFF2563EB)),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Icon(
+                                                        Icons.Default.Edit,
+                                                        contentDescription = "Not var",
+                                                        tint = Color.White,
+                                                        modifier = Modifier.size(10.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = "${pageIdx + 1}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (isSelected) Color(0xFF60A5FA) else Color.LightGray
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Sol Üst Sayfa Gezinme ve Kenar Çubuğu Açma Butonu
             if (totalPages > 0) {
                 Surface(
                     shape = RoundedCornerShape(20.dp),
-                    color = Color(0xCC1E1E1E),
+                    color = Color(0xDD1E1E24),
                     modifier = Modifier
                         .align(Alignment.TopStart)
                         .padding(start = 16.dp, top = 80.dp)
+                        .border(1.dp, Color(0x22FFFFFF), RoundedCornerShape(20.dp))
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                     ) {
+                        IconButton(
+                            onClick = { isSidebarOpen = !isSidebarOpen },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(Icons.Default.ViewSidebar, contentDescription = "Sayfalar Sekmesi", tint = Color.White)
+                        }
+
+                        Box(modifier = Modifier.width(1.dp).height(18.dp).background(Color(0x33FFFFFF)))
+
                         IconButton(
                             onClick = { if (currentPageIndex > 0) switchPage(currentPageIndex - 1) },
                             enabled = currentPageIndex > 0,
                             modifier = Modifier.size(32.dp)
                         ) {
-                            Icon(Icons.Default.ArrowBack, contentDescription = "Önceki Sayfa", tint = Color.White)
+                            Icon(
+                                Icons.Default.ArrowBack,
+                                contentDescription = "Önceki Sayfa",
+                                tint = if (currentPageIndex > 0) Color.White else Color.DarkGray
+                            )
                         }
 
                         Text(
-                            text = "Sayfa ${currentPageIndex + 1} / $totalPages",
+                            text = "${currentPageIndex + 1} / $totalPages",
                             style = MaterialTheme.typography.labelMedium,
                             color = Color.White,
-                            modifier = Modifier.padding(horizontal = 8.dp)
+                            modifier = Modifier.padding(horizontal = 6.dp)
                         )
 
                         IconButton(
@@ -156,13 +348,17 @@ class MainActivity : ComponentActivity() {
                             enabled = currentPageIndex < totalPages - 1,
                             modifier = Modifier.size(32.dp)
                         ) {
-                            Icon(Icons.Default.ArrowForward, contentDescription = "Sonraki Sayfa", tint = Color.White)
+                            Icon(
+                                Icons.Default.ArrowForward,
+                                contentDescription = "Sonraki Sayfa",
+                                tint = if (currentPageIndex < totalPages - 1) Color.White else Color.DarkGray
+                            )
                         }
                     }
                 }
             }
 
-            // 3. Üst Kısma Alınan Minimalist Yüzen Araç Çubuğu (Kalem/Araç Seçimi)
+            // 4. Üst Kısma Alınan Minimalist Yüzen Araç Çubuğu
             AnimatedVisibility(
                 visible = isToolbarVisible,
                 enter = slideInVertically(initialOffsetY = { -it }) + fadeIn(),
@@ -172,7 +368,6 @@ class MainActivity : ComponentActivity() {
                     .padding(top = 16.dp)
             ) {
                 Column(horizontalAlignment = Alignment.CenterVertically) {
-                    // Ana Araç Çubuğu (Üstte)
                     Surface(
                         shape = RoundedCornerShape(20.dp),
                         color = Color(0xF018181B),
@@ -194,7 +389,8 @@ class MainActivity : ComponentActivity() {
                                 onClick = { openPdfLauncher.launch(arrayOf("application/pdf")) }
                             )
 
-                            VerticalDivider(modifier = Modifier.height(24.dp).padding(horizontal = 4.dp))
+                            // Bölücü (Tüm Compose sürümleri ile %100 uyumlu)
+                            Box(modifier = Modifier.width(1.dp).height(24.dp).background(Color(0x33FFFFFF)))
 
                             // Kalem
                             ToolIconToggle(
@@ -204,8 +400,6 @@ class MainActivity : ComponentActivity() {
                                 onClick = {
                                     activeTool = ToolMode.PEN
                                     canvasView?.currentMode = ToolMode.PEN
-                                    canvasView?.strokeColor = activeColor
-                                    canvasView?.baseStrokeWidth = activeWidth
                                 }
                             )
 
@@ -217,8 +411,6 @@ class MainActivity : ComponentActivity() {
                                 onClick = {
                                     activeTool = ToolMode.HIGHLIGHTER
                                     canvasView?.currentMode = ToolMode.HIGHLIGHTER
-                                    canvasView?.strokeColor = AndroidColor.parseColor("#F59E0B")
-                                    canvasView?.baseStrokeWidth = activeWidth
                                 }
                             )
 
@@ -244,9 +436,9 @@ class MainActivity : ComponentActivity() {
                                 }
                             )
 
-                            VerticalDivider(modifier = Modifier.height(24.dp).padding(horizontal = 4.dp))
+                            Box(modifier = Modifier.width(1.dp).height(24.dp).background(Color(0x33FFFFFF)))
 
-                            // Renk Seçici Tetikleyici (Seçili rengi gösterir)
+                            // Renk Seçici Butonu (Seçili aracın rengini gösterir)
                             Box(
                                 modifier = Modifier
                                     .size(30.dp)
@@ -256,7 +448,7 @@ class MainActivity : ComponentActivity() {
                                     .clickable { showColorPicker = !showColorPicker }
                             )
 
-                            VerticalDivider(modifier = Modifier.height(24.dp).padding(horizontal = 4.dp))
+                            Box(modifier = Modifier.width(1.dp).height(24.dp).background(Color(0x33FFFFFF)))
 
                             // Geri Al
                             IconButton(
@@ -267,7 +459,7 @@ class MainActivity : ComponentActivity() {
                                 Icon(
                                     Icons.Default.Undo,
                                     contentDescription = "Geri Al",
-                                    tint = if (canUndo) Color.White else Color.Gray
+                                    tint = if (canUndo) Color.White else Color.DarkGray
                                 )
                             }
 
@@ -280,15 +472,15 @@ class MainActivity : ComponentActivity() {
                                 Icon(
                                     Icons.Default.Redo,
                                     contentDescription = "Yinele",
-                                    tint = if (canRedo) Color.White else Color.Gray
+                                    tint = if (canRedo) Color.White else Color.DarkGray
                                 )
                             }
 
-                            VerticalDivider(modifier = Modifier.height(24.dp).padding(horizontal = 4.dp))
+                            Box(modifier = Modifier.width(1.dp).height(24.dp).background(Color(0x33FFFFFF)))
 
-                            // Dışa Aktar
+                            // Dışa Aktar Butonu
                             Button(
-                                onClick = { exportAnnotatedDocument() },
+                                onClick = { showExportDialog = true },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB)),
                                 shape = RoundedCornerShape(12.dp),
                                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
@@ -304,7 +496,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    // En az 10 Farklı Renkten Oluşan Renk Paleti Seçicisi (Araç çubuğunun hemen altında)
+                    // En az 10 Farklı Renkten Oluşan Renk Paleti (Kalem ve Vurgulayıcı birbirinden bağımsız)
                     if (showColorPicker && (activeTool == ToolMode.PEN || activeTool == ToolMode.HIGHLIGHTER)) {
                         Surface(
                             shape = RoundedCornerShape(16.dp),
@@ -319,7 +511,7 @@ class MainActivity : ComponentActivity() {
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                paletteColors.forEach { colorInt ->
+                                currentPalette.forEach { colorInt ->
                                     Box(
                                         modifier = Modifier
                                             .size(28.dp)
@@ -331,8 +523,13 @@ class MainActivity : ComponentActivity() {
                                                 shape = CircleShape
                                             )
                                             .clickable {
-                                                activeColor = colorInt
-                                                canvasView?.strokeColor = colorInt
+                                                if (activeTool == ToolMode.HIGHLIGHTER) {
+                                                    highlighterColor = colorInt
+                                                    canvasView?.highlighterColor = colorInt
+                                                } else {
+                                                    penColor = colorInt
+                                                    canvasView?.penColor = colorInt
+                                                }
                                                 showColorPicker = false
                                             }
                                     )
@@ -341,6 +538,71 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+            }
+
+            // Dışa Aktarma İletişim Kutusu (PDF vs Sayfa Görüntüsü)
+            if (showExportDialog) {
+                AlertDialog(
+                    onDismissRequest = { showExportDialog = false },
+                    title = { Text("Dışa Aktar", color = Color.White) },
+                    text = {
+                        Column {
+                            Text(
+                                "Notlarınızı orijinal PDF formatında veya tek sayfalık yüksek çözünürlüklü görüntü olarak kaydedebilirsiniz:",
+                                color = Color.LightGray,
+                                fontSize = 14.sp
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        Button(
+                            onClick = {
+                                showExportDialog = false
+                                exportPdfLauncher.launch("Notlar_${System.currentTimeMillis()}.pdf")
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
+                        ) {
+                            Text("PDF Olarak Kaydet (Tüm Sayfalar)")
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            onClick = {
+                                showExportDialog = false
+                                exportCurrentPageAsImage()
+                            }
+                        ) {
+                            Text("Görüntü (PNG)", color = Color(0xFF93C5FD))
+                        }
+                    },
+                    containerColor = Color(0xFF1E1E24)
+                )
+            }
+
+            // İşlem Göstergesi (PDF Dışa Aktarılırken)
+            if (isExporting) {
+                Surface(
+                    color = Color(0xAA000000),
+                    modifier = Modifier.fillMaxSize().zIndex(100f)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = Color(0xFF27272A),
+                            modifier = Modifier.padding(32.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(24.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(16.dp)
+                            ) {
+                                CircularProgressIndicator(color = Color(0xFF3B82F6))
+                                Text("PDF Dışa Aktarılıyor...", color = Color.White)
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -386,21 +648,58 @@ class MainActivity : ComponentActivity() {
 
     private fun loadPdfDocument(uri: Uri) {
         currentPdfUri = uri
+        pageAnnotations.clear()
+        pageThumbnails.clear()
+
         val pages = pdfEngine.openPdf(uri)
         totalPages = pages
         currentPageIndex = 0
 
         if (pages > 0) {
             renderCurrentPage()
-            Toast.makeText(this, "Loaded PDF: $pages pages", Toast.LENGTH_SHORT).show()
+            loadThumbnailsInBackground(pages)
+            Toast.makeText(this, "PDF Yüklendi: $pages Sayfa", Toast.LENGTH_SHORT).show()
         } else {
-            Toast.makeText(this, "Failed to parse PDF document", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "PDF Dosyası Açılamadı", Toast.LENGTH_LONG).show()
         }
     }
 
-    private fun switchPage(index: Int) {
-        currentPageIndex = index
-        canvasView?.clearAllStrokes()
+    /**
+     * Arka planda sol kenar çubuğu için düşük çözünürlüklü küçük resimleri (thumbnails) yükler.
+     * Belleği korumak için 140px genişlikte çizilir.
+     */
+    private fun loadThumbnailsInBackground(total: Int) {
+        kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+            for (i in 0 until total) {
+                val thumb = pdfEngine.renderThumbnail(i, 140)
+                if (thumb != null) {
+                    withContext(Dispatchers.Main) {
+                        pageThumbnails[i] = thumb
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Sayfalar arası geçiş: Mevcut sayfanın çizimlerini kaydeder, hedef sayfanın çizimlerini yükler.
+     */
+    private fun switchPage(newIndex: Int) {
+        if (newIndex < 0 || newIndex >= totalPages) return
+
+        // 1. Mevcut sayfadaki çizimleri önbelleğe kaydet
+        canvasView?.let {
+            pageAnnotations[currentPageIndex] = it.getStrokesCopy()
+        }
+
+        // 2. Yeni sayfaya geç
+        currentPageIndex = newIndex
+
+        // 3. Yeni sayfanın çizimlerini tuvale yükle
+        val savedStrokes = pageAnnotations[newIndex] ?: emptyList()
+        canvasView?.setStrokes(savedStrokes)
+
+        // 4. PDF sayfa arka planını render et
         renderCurrentPage()
     }
 
@@ -414,12 +713,90 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun exportAnnotatedDocument() {
+    /**
+     * Tüm sayfaları ve üzerlerindeki el yazısı notları birleştirerek gerçek bir PDF dosyası olarak dışa aktarır.
+     */
+    private fun exportAnnotatedPdfToUri(destinationUri: Uri) {
+        // Mevcut sayfanın aktif çizimlerini önbelleğe al
+        canvasView?.let {
+            pageAnnotations[currentPageIndex] = it.getStrokesCopy()
+        }
+
+        isExporting = true
+        kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val tempPdfFile = File(cacheDir, "temp_export_${System.currentTimeMillis()}.pdf")
+                val exportWidth = 1080
+                val exportHeight = 1920
+
+                val success = pdfEngine.exportAnnotatedPdf(totalPages, tempPdfFile) { pageIdx, w, h ->
+                    // Her sayfa için PDF arka planını render et
+                    val bgBitmap = pdfEngine.renderPage(pageIdx, exportWidth, exportHeight) ?: return@exportAnnotatedPdf null
+                    
+                    // Üzerine o sayfanın el yazısı notlarını çiz
+                    val combinedBitmap = Bitmap.createBitmap(exportWidth, exportHeight, Bitmap.Config.ARGB_8888)
+                    val canvas = Canvas(combinedBitmap)
+                    canvas.drawBitmap(bgBitmap, 0f, 0f, null)
+
+                    val strokes = pageAnnotations[pageIdx] ?: emptyList()
+                    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        style = Paint.Style.STROKE
+                        strokeCap = Paint.Cap.ROUND
+                        strokeJoin = Paint.Join.ROUND
+                    }
+
+                    for (stroke in strokes) {
+                        paint.color = stroke.color
+                        paint.strokeWidth = stroke.width
+                        if (stroke.mode == ToolMode.HIGHLIGHTER) {
+                            paint.alpha = 110
+                        } else {
+                            paint.alpha = 255
+                        }
+                        canvas.drawPath(stroke.path, paint)
+                    }
+
+                    bgBitmap.recycle()
+                    combinedBitmap
+                }
+
+                if (success && tempPdfFile.exists()) {
+                    contentResolver.openOutputStream(destinationUri)?.use { out ->
+                        FileInputStream(tempPdfFile).use { input ->
+                            input.copyTo(out)
+                        }
+                    }
+                    tempPdfFile.delete()
+
+                    withContext(Dispatchers.Main) {
+                        isExporting = false
+                        Toast.makeText(this@MainActivity, "PDF Başarıyla Kaydedildi!", Toast.LENGTH_LONG).show()
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        isExporting = false
+                        Toast.makeText(this@MainActivity, "PDF Dışa Aktarılamadı", Toast.LENGTH_LONG).show()
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                withContext(Dispatchers.Main) {
+                    isExporting = false
+                    Toast.makeText(this@MainActivity, "Hata: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    /**
+     * Yalnızca mevcut sayfayı ve notları PNG görüntüsü olarak Downloads klasörüne kaydeder.
+     */
+    private fun exportCurrentPageAsImage() {
         val view = canvasView ?: return
         val flattened = view.createFlattenedBitmap()
 
         try {
-            val filename = "ZeroLag_Annotated_${System.currentTimeMillis()}.png"
+            val filename = "ZeroLag_Sayfa_${currentPageIndex + 1}_${System.currentTimeMillis()}.png"
             var outputStream: OutputStream? = null
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -440,18 +817,22 @@ class MainActivity : ComponentActivity() {
             }
 
             outputStream?.use { out ->
-                flattened.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+                flattened.compress(Bitmap.CompressFormat.PNG, 100, out)
             }
 
-            Toast.makeText(this, "Saved to Downloads: $filename", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Downloads Klasörüne Kaydedildi: $filename", Toast.LENGTH_LONG).show()
         } catch (e: Exception) {
             e.printStackTrace()
-            Toast.makeText(this, "Export failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Görüntü aktarma hatası: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        for (thumb in pageThumbnails.values) {
+            if (!thumb.isRecycled) thumb.recycle()
+        }
+        pageThumbnails.clear()
         pdfEngine.close()
     }
 }

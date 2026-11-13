@@ -80,6 +80,19 @@ kotlin.code.style=official
 `
       );
 
+      // Gradle Wrapper files
+      zip.file(
+        'ZeroLagNotes/gradle/wrapper/gradle-wrapper.properties',
+        `distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip
+networkTimeout=10000
+validateDistributionUrl=true
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+`
+      );
+
       // App folder
       const app = zip.folder('ZeroLagNotes/app');
       if (app) {
@@ -90,10 +103,30 @@ kotlin.code.style=official
             app.file('src/main/AndroidManifest.xml', f.code);
           } else if (f.name.endsWith('.kt')) {
             app.file(`src/main/java/com/zerolag/pdfnotes/${f.name}`, f.code);
+          } else if (f.name === 'themes.xml') {
+            app.file('src/main/res/values/themes.xml', f.code);
+          } else if (f.name === 'strings.xml') {
+            app.file('src/main/res/values/strings.xml', f.code);
+          } else if (f.name === 'colors.xml') {
+            app.file('src/main/res/values/colors.xml', f.code);
+          } else if (f.name === 'ic_launcher_foreground.xml') {
+            app.file('src/main/res/drawable/ic_launcher_foreground.xml', f.code);
+          } else if (f.name === 'ic_launcher_background.xml') {
+            app.file('src/main/res/drawable/ic_launcher_background.xml', f.code);
           } else if (f.name.endsWith('.md')) {
             zip.file(`ZeroLagNotes/${f.path}`, f.code);
           }
         });
+
+        // Mipmap adaptive icons
+        const adaptiveIconXml = `<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>
+`;
+        app.file('src/main/res/mipmap-anydpi-v26/ic_launcher.xml', adaptiveIconXml);
+        app.file('src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml', adaptiveIconXml);
 
         app.file(
           'proguard-rules.pro',
@@ -104,6 +137,28 @@ kotlin.code.style=official
 `
         );
       }
+
+      // Android Studio Derleme Kılavuzu
+      zip.file(
+        'ZeroLagNotes/ANDROID_STUDIO_KURULUM.md',
+        `# ZeroLag Notes - Android Studio Derleme Kılavuzu
+
+Bu proje standart Android Studio (Hedgehog 2023.1.1 veya daha yeni sürüm) ile doğrudan açılıp derlenecek şekilde yapılandırılmıştır.
+
+## Derleme Adımları:
+1. Bu ZIP arşivini bir klasöre çıkartın (örn: \`ZeroLagNotes\`).
+2. Android Studio'yu açın.
+3. **Open (Aç)** seçeneğine tıklayın ve \`ZeroLagNotes\` klasörünü seçin.
+4. Android Studio Gradle senkronizasyonunu otomatik olarak başlatacaktır (Gradle 8.5 ve Android Gradle Plugin 8.2.2).
+5. Senkronizasyon tamamlandığında üst menüden **Build > Make Project** (veya terminalden \`./gradlew assembleDebug\`) komutunu çalıştırın.
+6. Lenovo tabletinizi (USB Debugging açık şekilde) bağlayarak **Run (Çalıştır)** butonuna basın.
+
+## Minimum Sistem Gereksinimleri:
+- Android 8.0 (API 26) ve üzeri tüm tabletler.
+- Lenovo Tab M8, Tab M10, Lenovo Tab P11 ve Precision Pen / Active Pen uyumlu.
+- Sıfır dış bağımlılık (İnternet izni yoktur, %100 yerel ve gizlidir).
+`
+      );
 
       const content = await zip.generateAsync({ type: 'blob' });
       const url = URL.createObjectURL(content);

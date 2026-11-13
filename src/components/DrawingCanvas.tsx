@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { ToolMode, CanvasPoint, StrokeData, DocumentType, PalmRejectionLog } from '../types';
+import { RenderedPdfPage } from '../utils/pdfHelper';
 import {
   calculatePressureWidth,
   getMidPoint,
@@ -7,59 +8,79 @@ import {
   computeBoundingBox,
   isStrokeSelectedByLasso,
   shouldRejectPalmEvent,
+  determinePointerAction,
 } from '../utils/strokeMath';
 import { drawDocumentTemplate } from '../utils/documentRenderer';
+import { Pen, Hand } from 'lucide-react';
 
 interface DrawingCanvasProps {
   currentMode: ToolMode;
   strokeColor: string;
   baseStrokeWidth: number;
   documentType: DocumentType;
-  customPdfImage: HTMLImageElement | null;
-  currentPage: number;
-  totalPages: number;
+  customPdfPages: RenderedPdfPage[];
+  pageCount: number;
+  activePageIndex: number;
+  onActivePageChange: (index: number) => void;
   palmRejectionEnabled: boolean;
   palmContactThreshold: number;
   forceFingerMode: boolean; // Simulator toggle to test finger vs stylus
   onUndoChange: (canUndo: boolean, canRedo: boolean) => void;
   onPalmEvent: (log: PalmRejectionLog) => void;
   onStatsUpdate: (stats: { fps: number; latency: number; strokeCount: number; activePressure: number }) => void;
+  onThumbnailsUpdate: (thumbnails: { [pageIndex: number]: string }) => void;
   canvasRefCallback?: (handlers: {
     undo: () => void;
     redo: () => void;
     clear: () => void;
     deleteSelected: () => void;
-    exportImage: (format: 'png') => string | null;
+    exportImage: (format: 'png', pageIndex?: number) => string | null;
+    scrollToPage: (pageIndex: number) => void;
   }) => void;
 }
+
+// Standard A4 aspect ratio dimensions for crisp tablet display
+const PAGE_WIDTH = 920;
+const PAGE_HEIGHT = 1300;
 
 export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
   currentMode,
   strokeColor,
   baseStrokeWidth,
   documentType,
-  customPdfImage,
-  currentPage,
+  customPdfPages,
+  pageCount,
+  activePageIndex,
+  onActivePageChange,
   palmRejectionEnabled,
   palmContactThreshold,
   forceFingerMode,
   onUndoChange,
   onPalmEvent,
   onStatsUpdate,
+  onThumbnailsUpdate,
   canvasRefCallback,
 }) => {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const bgCanvasRef = useRef<HTMLCanvasElement>(null);
-  const drawCanvasRef = useRef<HTMLCanvasElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
 
-  // Stroke memory structures
-  const strokesRef = useRef<StrokeData[]>([]);
-  const undoStackRef = useRef<StrokeData[]>([]);
+  // Per-page canvas element references
+  const bgCanvasesRef = useRef<{ [pageIndex: number]: HTMLCanvasElement | null }>({});
+  const drawCanvasesRef = useRef<{ [pageIndex: number]: HTMLCanvasElement | null }>({});
 
-  // Active in-progress stroke
+  // Strokes organized by page index
+  const strokesByPageRef = useRef<{ [pageIndex: number]: StrokeData[] }>({});
+  const undoStackByPageRef = useRef<{ [pageIndex: number]: StrokeData[] }>({});
+
+  // Active in-progress drawing stroke
   const isDrawingRef = useRef(false);
+  const activeDrawingPageRef = useRef<number | null>(null);
   const activePointsRef = useRef<CanvasPoint[]>([]);
   const lastStylusTimeRef = useRef(0);
+
+  // Finger Pan / Scroll state (Kalem yokken parmakla yazma engeli)
+  const isFingerScrollingRef = useRef(false);
+  const fingerScrollStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [fingerScrollIndicator, setFingerScrollIndicator] = useState(false);
 
   // Selection / Lasso state
   const lassoPointsRef = useRef<{ x: number; y: number }[]>([]);
@@ -68,26 +89,54 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
   const dragStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const selectionBoundsRef = useRef<{ left: number; top: number; right: number; bottom: number } | null>(null);
 
-  // Performance telemetry
+  // Telemetry metrics
   const frameCountRef = useRef(0);
   const lastFpsTimeRef = useRef(performance.now());
   const activePressureRef = useRef(0.5);
 
-  // Notification for visual palm rejection toast
+  // Palm rejection visual alerts
   const [palmRejectionAlert, setPalmRejectionAlert] = useState<{ x: number; y: number; reason: string } | null>(null);
 
+  // Total pages list
+  const totalPagesList = Array.from({ length: pageCount }, (_, i) => i);
+
   /**
-   * Redraws all completed strokes onto the main drawing canvas.
+   * Generates a miniature thumbnail data URL for a specific page.
    */
-  const redrawCommittedStrokes = useCallback(() => {
-    const canvas = drawCanvasRef.current;
+  const generatePageThumbnail = useCallback((pageIndex: number) => {
+    const bgCanvas = bgCanvasesRef.current[pageIndex];
+    const drawCanvas = drawCanvasesRef.current[pageIndex];
+    if (!bgCanvas) return;
+
+    const thumbW = 160;
+    const thumbH = Math.round((thumbW / bgCanvas.width) * bgCanvas.height);
+    const thumbCanvas = document.createElement('canvas');
+    thumbCanvas.width = thumbW;
+    thumbCanvas.height = thumbH;
+    const ctx = thumbCanvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.drawImage(bgCanvas, 0, 0, thumbW, thumbH);
+    if (drawCanvas) {
+      ctx.drawImage(drawCanvas, 0, 0, thumbW, thumbH);
+    }
+
+    const dataUrl = thumbCanvas.toDataURL('image/png');
+    onThumbnailsUpdate({ [pageIndex]: dataUrl });
+  }, [onThumbnailsUpdate]);
+
+  /**
+   * Redraws all completed strokes onto the drawing canvas of a specific page.
+   */
+  const redrawCommittedStrokesForPage = useCallback((pageIndex: number) => {
+    const canvas = drawCanvasesRef.current[pageIndex];
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    const strokes = strokesRef.current;
+    const strokes = strokesByPageRef.current[pageIndex] || [];
     for (let i = 0; i < strokes.length; i++) {
       const stroke = strokes[i];
       if (stroke.points.length < 2) continue;
@@ -111,7 +160,6 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       ctx.beginPath();
       ctx.moveTo(pts[0].x, pts[0].y);
 
-      // Render Bezier smoothed path
       for (let j = 1; j < pts.length; j++) {
         const mid = getMidPoint(pts[j - 1], pts[j]);
         ctx.lineWidth = calculatePressureWidth(stroke.baseWidth, pts[j].pressure);
@@ -119,7 +167,6 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       }
       ctx.stroke();
 
-      // If stroke is selected by lasso, highlight it slightly
       if (stroke.isSelected) {
         ctx.strokeStyle = '#3B82F6';
         ctx.lineWidth = stroke.baseWidth + 4;
@@ -130,8 +177,8 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       ctx.restore();
     }
 
-    // Render Lasso Selection Bounds if any
-    if (selectionBoundsRef.current && selectedStrokesRef.current.length > 0) {
+    // Render Lasso Selection Bounds if any on this page
+    if (activeDrawingPageRef.current === pageIndex && selectionBoundsRef.current && selectedStrokesRef.current.length > 0) {
       const b = selectionBoundsRef.current;
       ctx.save();
       ctx.strokeStyle = '#2563EB';
@@ -139,7 +186,6 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       ctx.setLineDash([6, 6]);
       ctx.strokeRect(b.left, b.top, b.right - b.left, b.bottom - b.top);
 
-      // Draw handles at 4 corners
       const r = 5;
       ctx.fillStyle = '#FFFFFF';
       ctx.setLineDash([]);
@@ -159,65 +205,54 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
   }, []);
 
   /**
-   * Redraws background PDF or template page.
+   * Redraws background PDF page or template for a specific page index.
    */
-  const redrawBackground = useCallback(() => {
-    const bgCanvas = bgCanvasRef.current;
+  const redrawBackgroundForPage = useCallback((pageIndex: number) => {
+    const bgCanvas = bgCanvasesRef.current[pageIndex];
     if (!bgCanvas) return;
     const ctx = bgCanvas.getContext('2d');
     if (!ctx) return;
 
-    if (customPdfImage) {
+    if (documentType === 'custom-pdf' && customPdfPages[pageIndex]) {
+      const pdfPage = customPdfPages[pageIndex];
       ctx.clearRect(0, 0, bgCanvas.width, bgCanvas.height);
       ctx.fillStyle = '#FFFFFF';
       ctx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
 
-      // Fit custom PDF image with aspect ratio
-      const scale = Math.min(bgCanvas.width / customPdfImage.width, bgCanvas.height / customPdfImage.height);
-      const drawW = customPdfImage.width * scale;
-      const drawH = customPdfImage.height * scale;
+      const scale = Math.min(bgCanvas.width / pdfPage.image.width, bgCanvas.height / pdfPage.image.height);
+      const drawW = pdfPage.image.width * scale;
+      const drawH = pdfPage.image.height * scale;
       const drawX = (bgCanvas.width - drawW) / 2;
       const drawY = (bgCanvas.height - drawH) / 2;
-      ctx.drawImage(customPdfImage, drawX, drawY, drawW, drawH);
+      ctx.drawImage(pdfPage.image, drawX, drawY, drawW, drawH);
     } else {
-      drawDocumentTemplate(ctx, bgCanvas.width, bgCanvas.height, documentType, currentPage);
+      drawDocumentTemplate(ctx, bgCanvas.width, bgCanvas.height, documentType, pageIndex);
     }
-  }, [customPdfImage, documentType, currentPage]);
+
+    // Generate initial thumbnail
+    generatePageThumbnail(pageIndex);
+  }, [documentType, customPdfPages, generatePageThumbnail]);
 
   /**
-   * Synchronizes canvas dimensions with container viewport.
+   * Initializes all pages background and dimensions.
    */
-  const resizeCanvases = useCallback(() => {
-    const container = containerRef.current;
-    const bgCanvas = bgCanvasRef.current;
-    const drawCanvas = drawCanvasRef.current;
-    if (!container || !bgCanvas || !drawCanvas) return;
-
-    const width = container.clientWidth;
-    const height = container.clientHeight;
-
-    if (bgCanvas.width !== width || bgCanvas.height !== height) {
-      bgCanvas.width = width;
-      bgCanvas.height = height;
-      drawCanvas.width = width;
-      drawCanvas.height = height;
-
-      redrawBackground();
-      redrawCommittedStrokes();
-    }
-  }, [redrawBackground, redrawCommittedStrokes]);
-
   useEffect(() => {
-    resizeCanvases();
-    window.addEventListener('resize', resizeCanvases);
-    return () => window.removeEventListener('resize', resizeCanvases);
-  }, [resizeCanvases]);
+    totalPagesList.forEach((idx) => {
+      const bg = bgCanvasesRef.current[idx];
+      const draw = drawCanvasesRef.current[idx];
+      if (bg && draw) {
+        bg.width = PAGE_WIDTH;
+        bg.height = PAGE_HEIGHT;
+        draw.width = PAGE_WIDTH;
+        draw.height = PAGE_HEIGHT;
 
-  useEffect(() => {
-    redrawBackground();
-  }, [redrawBackground]);
+        redrawBackgroundForPage(idx);
+        redrawCommittedStrokesForPage(idx);
+      }
+    });
+  }, [pageCount, documentType, customPdfPages, redrawBackgroundForPage, redrawCommittedStrokesForPage]);
 
-  // FPS & Latency measurement loop
+  // Telemetry loop for FPS and latency
   useEffect(() => {
     let animId: number;
     const loop = (now: number) => {
@@ -227,10 +262,13 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         const fps = Math.round((frameCountRef.current * 1000) / elapsed);
         frameCountRef.current = 0;
         lastFpsTimeRef.current = now;
+
+        const totalStrokes = Object.values(strokesByPageRef.current).reduce((acc, list) => acc + list.length, 0);
+
         onStatsUpdate({
           fps,
-          latency: isDrawingRef.current ? 4.2 : 1.8,
-          strokeCount: strokesRef.current.length,
+          latency: isDrawingRef.current ? 3.8 : 1.6,
+          strokeCount: totalStrokes,
           activePressure: activePressureRef.current,
         });
       }
@@ -240,49 +278,111 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
     return () => cancelAnimationFrame(animId);
   }, [onStatsUpdate]);
 
-  // Expose methods to parent toolbar (undo, redo, clear, export)
+  /**
+   * Scroll Listener: Detects which page is in view and updates active page index.
+   */
+  const handleScroll = useCallback(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+
+    const scrollTop = container.scrollTop;
+    const containerHeight = container.clientHeight;
+    const centerY = scrollTop + containerHeight / 3;
+
+    let closestPage = 0;
+    let minDistance = Infinity;
+
+    totalPagesList.forEach((idx) => {
+      const pageEl = document.getElementById(`pdf-page-card-${idx}`);
+      if (pageEl) {
+        const pageTop = pageEl.offsetTop;
+        const dist = Math.abs(pageTop - centerY);
+        if (dist < minDistance) {
+          minDistance = dist;
+          closestPage = idx;
+        }
+      }
+    });
+
+    if (closestPage !== activePageIndex) {
+      onActivePageChange(closestPage);
+    }
+  }, [activePageIndex, onActivePageChange, totalPagesList]);
+
+  // Expose methods to parent toolbar
   useEffect(() => {
     if (canvasRefCallback) {
       canvasRefCallback({
         undo: () => {
-          if (strokesRef.current.length > 0) {
-            const popped = strokesRef.current.pop()!;
+          const currentPageStrokes = strokesByPageRef.current[activePageIndex] || [];
+          if (currentPageStrokes.length > 0) {
+            const popped = currentPageStrokes.pop()!;
             popped.isSelected = false;
-            undoStackRef.current.push(popped);
+            if (!undoStackByPageRef.current[activePageIndex]) {
+              undoStackByPageRef.current[activePageIndex] = [];
+            }
+            undoStackByPageRef.current[activePageIndex].push(popped);
             selectedStrokesRef.current = [];
             selectionBoundsRef.current = null;
-            onUndoChange(strokesRef.current.length > 0, undoStackRef.current.length > 0);
-            redrawCommittedStrokes();
+
+            onUndoChange(
+              (strokesByPageRef.current[activePageIndex] || []).length > 0,
+              (undoStackByPageRef.current[activePageIndex] || []).length > 0
+            );
+
+            redrawCommittedStrokesForPage(activePageIndex);
+            generatePageThumbnail(activePageIndex);
           }
         },
         redo: () => {
-          if (undoStackRef.current.length > 0) {
-            const restored = undoStackRef.current.pop()!;
-            strokesRef.current.push(restored);
-            onUndoChange(strokesRef.current.length > 0, undoStackRef.current.length > 0);
-            redrawCommittedStrokes();
+          const undoStack = undoStackByPageRef.current[activePageIndex] || [];
+          if (undoStack.length > 0) {
+            const restored = undoStack.pop()!;
+            if (!strokesByPageRef.current[activePageIndex]) {
+              strokesByPageRef.current[activePageIndex] = [];
+            }
+            strokesByPageRef.current[activePageIndex].push(restored);
+
+            onUndoChange(
+              (strokesByPageRef.current[activePageIndex] || []).length > 0,
+              (undoStackByPageRef.current[activePageIndex] || []).length > 0
+            );
+
+            redrawCommittedStrokesForPage(activePageIndex);
+            generatePageThumbnail(activePageIndex);
           }
         },
         clear: () => {
-          undoStackRef.current.push(...strokesRef.current);
-          strokesRef.current = [];
+          const currentStrokes = strokesByPageRef.current[activePageIndex] || [];
+          if (!undoStackByPageRef.current[activePageIndex]) {
+            undoStackByPageRef.current[activePageIndex] = [];
+          }
+          undoStackByPageRef.current[activePageIndex].push(...currentStrokes);
+          strokesByPageRef.current[activePageIndex] = [];
           selectedStrokesRef.current = [];
           selectionBoundsRef.current = null;
-          onUndoChange(false, undoStackRef.current.length > 0);
-          redrawCommittedStrokes();
+
+          onUndoChange(false, (undoStackByPageRef.current[activePageIndex] || []).length > 0);
+          redrawCommittedStrokesForPage(activePageIndex);
+          generatePageThumbnail(activePageIndex);
         },
         deleteSelected: () => {
           if (selectedStrokesRef.current.length > 0) {
-            strokesRef.current = strokesRef.current.filter((s) => !s.isSelected);
+            strokesByPageRef.current[activePageIndex] = (strokesByPageRef.current[activePageIndex] || []).filter(
+              (s) => !s.isSelected
+            );
             selectedStrokesRef.current = [];
             selectionBoundsRef.current = null;
-            onUndoChange(strokesRef.current.length > 0, undoStackRef.current.length > 0);
-            redrawCommittedStrokes();
+
+            onUndoChange((strokesByPageRef.current[activePageIndex] || []).length > 0, true);
+            redrawCommittedStrokesForPage(activePageIndex);
+            generatePageThumbnail(activePageIndex);
           }
         },
-        exportImage: () => {
-          const bg = bgCanvasRef.current;
-          const draw = drawCanvasRef.current;
+        exportImage: (_format, targetPage) => {
+          const pIndex = targetPage !== undefined ? targetPage : activePageIndex;
+          const bg = bgCanvasesRef.current[pIndex];
+          const draw = drawCanvasesRef.current[pIndex];
           if (!bg || !draw) return null;
 
           const exportCanvas = document.createElement('canvas');
@@ -295,18 +395,24 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
           ctx.drawImage(draw, 0, 0);
           return exportCanvas.toDataURL('image/png');
         },
+        scrollToPage: (targetPage) => {
+          const el = document.getElementById(`pdf-page-card-${targetPage}`);
+          if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
+        },
       });
     }
-  }, [canvasRefCallback, onUndoChange, redrawCommittedStrokes]);
+  }, [canvasRefCallback, activePageIndex, onUndoChange, redrawCommittedStrokesForPage, generatePageThumbnail]);
 
   /**
-   * Evaluates stroke erasure around coordinates (x, y)
+   * Stroke Eraser: Erases strokes intersecting (x, y) on a specific page.
    */
   const eraseStrokesAround = useCallback(
-    (x: number, y: number) => {
-      const radiusSq = 20 * 20;
+    (pageIndex: number, x: number, y: number) => {
+      const radiusSq = 22 * 22;
       let erasedAny = false;
-      const strokes = strokesRef.current;
+      const strokes = strokesByPageRef.current[pageIndex] || [];
 
       for (let i = strokes.length - 1; i >= 0; i--) {
         const s = strokes[i];
@@ -330,41 +436,74 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
 
         if (hit) {
           const removed = strokes.splice(i, 1)[0];
-          undoStackRef.current.push(removed);
+          if (!undoStackByPageRef.current[pageIndex]) {
+            undoStackByPageRef.current[pageIndex] = [];
+          }
+          undoStackByPageRef.current[pageIndex].push(removed);
           erasedAny = true;
-          break; // Stroke eraser eliminates one stroke per contact
+          break;
         }
       }
 
       if (erasedAny) {
-        onUndoChange(strokesRef.current.length > 0, undoStackRef.current.length > 0);
-        redrawCommittedStrokes();
+        onUndoChange(
+          (strokesByPageRef.current[pageIndex] || []).length > 0,
+          (undoStackByPageRef.current[pageIndex] || []).length > 0
+        );
+        redrawCommittedStrokesForPage(pageIndex);
+        generatePageThumbnail(pageIndex);
       }
     },
-    [onUndoChange, redrawCommittedStrokes]
+    [onUndoChange, redrawCommittedStrokesForPage, generatePageThumbnail]
   );
 
   /**
-   * Pointer Event: Pointer Down
+   * Pointer Event: Pointer Down on a specific page
    */
-  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+  const handlePointerDown = (pageIndex: number, e: React.PointerEvent<HTMLCanvasElement>) => {
+    const action = determinePointerAction(e.pointerType, !forceFingerMode);
+
+    // ------------------------------------------------------------------
+    // PARMAK İLE DOKUNMA: ASLA ÇİZİM YAPMAZ, YALNIZCA SAYFAYI SÜRÜKLER/KAYDIRIR
+    // ------------------------------------------------------------------
+    if (action === 'SCROLL') {
+      isFingerScrollingRef.current = true;
+      fingerScrollStartRef.current = { x: e.clientX, y: e.clientY };
+      setFingerScrollIndicator(true);
+
+      onPalmEvent({
+        id: Math.random().toString(36).substring(7),
+        timestamp: performance.now(),
+        pointerType: 'parmak (sadece sürükleme)',
+        action: 'ACCEPTED',
+        reason: 'Parmakla Sayfa Kaydırma Aktif',
+        pressure: 0,
+        contactWidth: forceFingerMode ? 72 : e.width || 25,
+      });
+      return;
+    }
+
+    // ------------------------------------------------------------------
+    // AKTİF KALEM İLE DOKUNMA: ÇİZİM / ANNOTASYON MODU
+    // ------------------------------------------------------------------
     const rect = e.currentTarget.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const scaleX = PAGE_WIDTH / rect.width;
+    const scaleY = PAGE_HEIGHT / rect.height;
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
     const now = performance.now();
 
-    // Determine if input is active stylus vs finger
     const isStylusInput = !forceFingerMode && (e.pointerType === 'pen' || e.pointerType === 'mouse');
     const contactWidth = forceFingerMode ? 72 : e.width && e.width > 5 ? e.width : 15;
 
-    // Palm Rejection Decision Check
+    // Palm Rejection Check
     if (palmRejectionEnabled) {
       const rejection = shouldRejectPalmEvent({
         isStylus: isStylusInput,
         currentTime: now,
         lastStylusTime: lastStylusTimeRef.current,
-        contactWidth: contactWidth,
-        palmContactThreshold: palmContactThreshold,
+        contactWidth,
+        palmContactThreshold,
       });
 
       if (rejection.reject) {
@@ -379,12 +518,12 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         });
 
         setPalmRejectionAlert({
-          x,
-          y,
+          x: e.clientX,
+          y: e.clientY,
           reason: rejection.reason === 'STYLUS_COOLDOWN' ? 'Avuç içi yoksayıldı (kalem aktif)' : 'Avuç içi teması engellendi',
         });
         setTimeout(() => setPalmRejectionAlert(null), 1200);
-        return; // Reject and ignore palm touch!
+        return;
       }
     }
 
@@ -401,8 +540,13 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       contactWidth,
     });
 
-    // Check if dragging an existing lasso selection
-    if (currentMode === 'lasso' && selectedStrokesRef.current.length > 0 && selectionBoundsRef.current) {
+    // Check Lasso Dragging
+    if (
+      currentMode === 'lasso' &&
+      activeDrawingPageRef.current === pageIndex &&
+      selectedStrokesRef.current.length > 0 &&
+      selectionBoundsRef.current
+    ) {
       const b = selectionBoundsRef.current;
       if (x >= b.left && x <= b.right && y >= b.top && y <= b.bottom) {
         isDraggingSelectionRef.current = true;
@@ -411,20 +555,21 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       }
     }
 
-    // Clear selection if clicking outside
+    // Clear Selection
     if (selectedStrokesRef.current.length > 0) {
-      strokesRef.current.forEach((s) => (s.isSelected = false));
+      Object.values(strokesByPageRef.current).forEach((list) => list.forEach((s) => (s.isSelected = false)));
       selectedStrokesRef.current = [];
       selectionBoundsRef.current = null;
-      redrawCommittedStrokes();
+      redrawCommittedStrokesForPage(pageIndex);
     }
 
     isDrawingRef.current = true;
+    activeDrawingPageRef.current = pageIndex;
     const initialPressure = e.pressure > 0 ? e.pressure : 0.5;
     activePressureRef.current = initialPressure;
 
     if (currentMode === 'eraser-stroke') {
-      eraseStrokesAround(x, y);
+      eraseStrokesAround(pageIndex, x, y);
       return;
     }
 
@@ -439,21 +584,36 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
   /**
    * Pointer Event: Pointer Move
    */
-  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+  const handlePointerMove = (pageIndex: number, e: React.PointerEvent<HTMLCanvasElement>) => {
+    // ------------------------------------------------------------------
+    // PARMAKLA SÜRÜKLEME İŞLEMİ: Tüm belgeyi dikey/yatay kaydırır
+    // ------------------------------------------------------------------
+    if (isFingerScrollingRef.current && scrollContainerRef.current) {
+      const dx = e.clientX - fingerScrollStartRef.current.x;
+      const dy = e.clientY - fingerScrollStartRef.current.y;
+      fingerScrollStartRef.current = { x: e.clientX, y: e.clientY };
+
+      scrollContainerRef.current.scrollTop -= dy;
+      scrollContainerRef.current.scrollLeft -= dx;
+      return;
+    }
+
     const rect = e.currentTarget.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const scaleX = PAGE_WIDTH / rect.width;
+    const scaleY = PAGE_HEIGHT / rect.height;
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
     const now = performance.now();
 
-    // Hover detection for active stylus (Lenovo Active Pen hovering above screen)
     const isStylusInput = !forceFingerMode && (e.pointerType === 'pen' || e.pointerType === 'mouse');
     if (isStylusInput) {
       lastStylusTimeRef.current = now;
     }
 
     if (!isDrawingRef.current && !isDraggingSelectionRef.current) return;
+    if (activeDrawingPageRef.current !== pageIndex) return;
 
-    // Handle Lasso Selection Dragging
+    // Drag Lasso Selection
     if (isDraggingSelectionRef.current) {
       const dx = x - dragStartRef.current.x;
       const dy = y - dragStartRef.current.y;
@@ -471,26 +631,25 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         selectionBoundsRef.current.bottom += dy;
       }
 
-      redrawCommittedStrokes();
+      redrawCommittedStrokesForPage(pageIndex);
       return;
     }
 
-    // Handle Stroke Eraser
+    // Eraser Mode
     if (currentMode === 'eraser-stroke') {
-      eraseStrokesAround(x, y);
+      eraseStrokesAround(pageIndex, x, y);
       return;
     }
 
-    // Handle Lasso Drawing
+    // Lasso Mode
     if (currentMode === 'lasso') {
       lassoPointsRef.current.push({ x, y });
-      // Render active lasso dashed line
-      const canvas = drawCanvasRef.current;
+      const canvas = drawCanvasesRef.current[pageIndex];
       if (!canvas) return;
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
 
-      redrawCommittedStrokes();
+      redrawCommittedStrokesForPage(pageIndex);
 
       ctx.save();
       ctx.strokeStyle = '#2563EB';
@@ -507,13 +666,13 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       return;
     }
 
-    // Process coalesced events if hardware digitizer provides them (matching event.historySize)
+    // Subframe Digitizer Samples
     const coalesced = (e.nativeEvent as PointerEvent).getCoalescedEvents?.() || [];
     if (coalesced.length > 0) {
       for (let c = 0; c < coalesced.length; c++) {
         const ce = coalesced[c];
-        const cx = ce.clientX - rect.left;
-        const cy = ce.clientY - rect.top;
+        const cx = (ce.clientX - rect.left) * scaleX;
+        const cy = (ce.clientY - rect.top) * scaleY;
         const cp = ce.pressure > 0 ? ce.pressure : 0.5;
         activePointsRef.current.push({ x: cx, y: cy, pressure: cp, time: ce.timeStamp });
       }
@@ -523,13 +682,13 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       activePointsRef.current.push({ x, y, pressure: p, time: now });
     }
 
-    // Progressive rendering of the active stroke onto canvas
-    const canvas = drawCanvasRef.current;
+    // Progressive Draw
+    const canvas = drawCanvasesRef.current[pageIndex];
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    redrawCommittedStrokes();
+    redrawCommittedStrokesForPage(pageIndex);
 
     const pts = activePointsRef.current;
     if (pts.length < 2) return;
@@ -562,7 +721,14 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
   /**
    * Pointer Event: Pointer Up / Cancel
    */
-  const handlePointerUp = () => {
+  const handlePointerUp = (pageIndex: number) => {
+    // End Finger Pan
+    if (isFingerScrollingRef.current) {
+      isFingerScrollingRef.current = false;
+      setTimeout(() => setFingerScrollIndicator(false), 500);
+      return;
+    }
+
     if (isDraggingSelectionRef.current) {
       isDraggingSelectionRef.current = false;
       return;
@@ -571,13 +737,14 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
     if (!isDrawingRef.current) return;
     isDrawingRef.current = false;
 
-    // Evaluate Lasso Selection
+    // Finalize Lasso
     if (currentMode === 'lasso') {
-      const lassoLoop = lassoPointsRef.current;
-      if (lassoLoop.length > 5) {
+      const loop = lassoPointsRef.current;
+      if (loop.length > 5) {
         const selected: StrokeData[] = [];
-        strokesRef.current.forEach((stroke) => {
-          if (isStrokeSelectedByLasso(stroke.points, lassoLoop)) {
+        const strokes = strokesByPageRef.current[pageIndex] || [];
+        strokes.forEach((stroke) => {
+          if (isStrokeSelectedByLasso(stroke.points, loop)) {
             stroke.isSelected = true;
             selected.push(stroke);
           } else {
@@ -588,20 +755,18 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         selectedStrokesRef.current = selected;
 
         if (selected.length > 0) {
-          // Compute bounding box around all selected strokes
           const allPoints = selected.flatMap((s) => s.points.map((p) => ({ x: p.x + s.offsetX, y: p.y + s.offsetY })));
-          const box = computeBoundingBox(allPoints, 12);
-          selectionBoundsRef.current = box;
+          selectionBoundsRef.current = computeBoundingBox(allPoints, 12);
         } else {
           selectionBoundsRef.current = null;
         }
       }
       lassoPointsRef.current = [];
-      redrawCommittedStrokes();
+      redrawCommittedStrokesForPage(pageIndex);
       return;
     }
 
-    // Commit active vector stroke
+    // Commit Stroke to this specific page
     if (activePointsRef.current.length > 1 && currentMode !== 'eraser-stroke') {
       const stroke: StrokeData = {
         id: Math.random().toString(36).substring(7),
@@ -614,39 +779,93 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         offsetY: 0,
       };
 
-      strokesRef.current.push(stroke);
-      undoStackRef.current = []; // Invalidate redo stack on new action
+      if (!strokesByPageRef.current[pageIndex]) {
+        strokesByPageRef.current[pageIndex] = [];
+      }
+      strokesByPageRef.current[pageIndex].push(stroke);
+      undoStackByPageRef.current[pageIndex] = [];
+
       onUndoChange(true, false);
+      generatePageThumbnail(pageIndex);
     }
 
     activePointsRef.current = [];
-    redrawCommittedStrokes();
+    activeDrawingPageRef.current = null;
+    redrawCommittedStrokesForPage(pageIndex);
   };
 
   return (
     <div
-      ref={containerRef}
-      className="relative w-full h-full overflow-hidden select-none touch-none bg-slate-900 cursor-crosshair"
+      ref={scrollContainerRef}
+      onScroll={handleScroll}
+      className="relative w-full h-full overflow-y-auto overflow-x-auto bg-slate-950 select-none touch-none scroll-smooth"
     >
-      {/* Background Canvas: Document / PDF Page */}
-      <canvas ref={bgCanvasRef} className="absolute inset-0 z-0 pointer-events-none" />
+      {/* Sürükleme / Kaydırma Göstergesi (Parmakla dokunulduğunda gösterilir) */}
+      {fingerScrollIndicator && (
+        <div className="fixed top-20 left-1/2 transform -translate-x-1/2 z-50 pointer-events-none px-4 py-2 rounded-2xl bg-slate-900/90 text-blue-300 border border-blue-500/50 shadow-2xl backdrop-blur-xl flex items-center gap-2 text-xs font-semibold animate-in fade-in slide-in-from-top-2">
+          <Hand className="w-4 h-4 text-amber-400" />
+          <span>Parmakla Kaydırma Aktif (Yazmak için Aktif Kalem kullanın)</span>
+        </div>
+      )}
 
-      {/* Foreground Canvas: Zero-Lag Vector Annotations */}
-      <canvas
-        ref={drawCanvasRef}
-        className="absolute inset-0 z-10 touch-none"
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerUp}
-        onPointerLeave={handlePointerUp}
-      />
+      {/* DİKEY OLARAK ALT ALTA YÜKLENEN PDF / ŞABLON SAYFALARI */}
+      <div className="flex flex-col items-center gap-10 py-24 px-4 min-w-[960px]">
+        {totalPagesList.map((pageIdx) => {
+          const isActive = pageIdx === activePageIndex;
 
-      {/* Palm Rejection Notification Indicator */}
+          return (
+            <div
+              key={pageIdx}
+              id={`pdf-page-card-${pageIdx}`}
+              className={`relative rounded-2xl bg-white shadow-2xl transition-all ${
+                isActive ? 'ring-2 ring-blue-500/80 shadow-blue-500/10' : 'ring-1 ring-slate-800'
+              }`}
+              style={{ width: PAGE_WIDTH, height: PAGE_HEIGHT }}
+            >
+              {/* Sayfa Başlığı ve Numarası Rozeti */}
+              <div className="absolute -top-7 left-2 flex items-center gap-2 text-xs text-slate-400 font-medium">
+                <span className="font-mono bg-slate-900 px-2.5 py-0.5 rounded-lg border border-slate-800 text-slate-300">
+                  Sayfa {pageIdx + 1} / {pageCount}
+                </span>
+                {isActive && (
+                  <span className="text-[10px] text-blue-400 font-semibold bg-blue-600/20 px-2 py-0.5 rounded-md border border-blue-500/30">
+                    Görüntülenen Sayfa
+                  </span>
+                )}
+              </div>
+
+              {/* Alt Katman: Belge / PDF Sayfası */}
+              <canvas
+                ref={(el) => {
+                  bgCanvasesRef.current[pageIdx] = el;
+                }}
+                className="absolute inset-0 rounded-2xl pointer-events-none"
+              />
+
+              {/* Üst Katman: Sıfır-Gecikmeli Vektör Çizim Tuvali */}
+              <canvas
+                ref={(el) => {
+                  drawCanvasesRef.current[pageIdx] = el;
+                }}
+                className={`absolute inset-0 rounded-2xl touch-none ${
+                  forceFingerMode ? 'cursor-grab active:cursor-grabbing' : 'cursor-crosshair'
+                }`}
+                onPointerDown={(e) => handlePointerDown(pageIdx, e)}
+                onPointerMove={(e) => handlePointerMove(pageIdx, e)}
+                onPointerUp={() => handlePointerUp(pageIdx)}
+                onPointerCancel={() => handlePointerUp(pageIdx)}
+                onPointerLeave={() => handlePointerUp(pageIdx)}
+              />
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Avuç İçi Reddedildi Uyarısı */}
       {palmRejectionAlert && (
         <div
-          className="absolute z-20 pointer-events-none transform -translate-x-1/2 -translate-y-full px-3 py-1.5 rounded-full bg-rose-600/90 text-white text-xs font-medium shadow-lg backdrop-blur-sm border border-rose-400 flex items-center gap-1.5 animate-pulse"
-          style={{ left: palmRejectionAlert.x, top: palmRejectionAlert.y - 12 }}
+          className="fixed z-50 pointer-events-none transform -translate-x-1/2 -translate-y-full px-3 py-1.5 rounded-full bg-rose-600/90 text-white text-xs font-semibold shadow-2xl backdrop-blur-md border border-rose-400 flex items-center gap-1.5 animate-pulse"
+          style={{ left: palmRejectionAlert.x, top: palmRejectionAlert.y - 14 }}
         >
           <span className="w-2 h-2 rounded-full bg-white animate-ping" />
           <span>{palmRejectionAlert.reason}</span>

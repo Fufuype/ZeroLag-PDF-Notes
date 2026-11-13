@@ -138,25 +138,65 @@ zipStorePath=wrapper/dists
         );
       }
 
-      // Android Studio Derleme Kılavuzu
+      // GitHub Actions Bulut APK Derleme İş Akışı (Android Studio olmadan APK üretmek için)
+      zip.file(
+        'ZeroLagNotes/.github/workflows/build-apk.yml',
+        `name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+
+      - name: Build Debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZeroLagNotes-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+`
+      );
+
+      // Android Studio / Bulut Derleme Kılavuzu
       zip.file(
         'ZeroLagNotes/ANDROID_STUDIO_KURULUM.md',
-        `# ZeroLag Notes - Android Studio Derleme Kılavuzu
+        `# ZeroLag Notes - APK Derleme Kılavuzu
 
-Bu proje standart Android Studio (Hedgehog 2023.1.1 veya daha yeni sürüm) ile doğrudan açılıp derlenecek şekilde yapılandırılmıştır.
+## Seçenek A: Android Studio Kurmadan Bulutta APK Derleme (GitHub Actions - Önerilen)
+Bilgisayarınıza Android Studio kurmak istemiyorsanız, bu ZIP dosyası otomatik bulut APK derleyicisi içerir:
+1. GitHub'da yeni (gizli/private olabilir) bir depo (repository) oluşturun.
+2. Bu ZIP'ten çıkardığınız tüm dosyaları (özellikle \`.github\` klasörünü) depoya yükleyin.
+3. GitHub sayfasında **Actions** sekmesine girin → **Build Android APK** iş akışı otomatik çalışacaktır (2-3 dakika sürer).
+4. İşlem bitince en alttaki **Artifacts** bölümünden \`ZeroLagNotes-debug-apk\` dosyasını indirin — doğrudan tabletinize kurabileceğiniz \`.apk\` dosyası hazırdır!
 
-## Derleme Adımları:
+## Seçenek B: Android Studio ile Derleme
 1. Bu ZIP arşivini bir klasöre çıkartın (örn: \`ZeroLagNotes\`).
-2. Android Studio'yu açın.
-3. **Open (Aç)** seçeneğine tıklayın ve \`ZeroLagNotes\` klasörünü seçin.
-4. Android Studio Gradle senkronizasyonunu otomatik olarak başlatacaktır (Gradle 8.5 ve Android Gradle Plugin 8.2.2).
-5. Senkronizasyon tamamlandığında üst menüden **Build > Make Project** (veya terminalden \`./gradlew assembleDebug\`) komutunu çalıştırın.
-6. Lenovo tabletinizi (USB Debugging açık şekilde) bağlayarak **Run (Çalıştır)** butonuna basın.
-
-## Minimum Sistem Gereksinimleri:
-- Android 8.0 (API 26) ve üzeri tüm tabletler.
-- Lenovo Tab M8, Tab M10, Lenovo Tab P11 ve Precision Pen / Active Pen uyumlu.
-- Sıfır dış bağımlılık (İnternet izni yoktur, %100 yerel ve gizlidir).
+2. Android Studio'yu açıp **Open** ile bu klasörü seçin.
+3. Gradle 8.5 senkronizasyonu bitince **Build > Build Bundle(s) / APK(s) > Build APK(s)** ile APK üretin.
 `
       );
 

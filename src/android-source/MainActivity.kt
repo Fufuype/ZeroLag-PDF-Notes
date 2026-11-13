@@ -5,7 +5,6 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color as AndroidColor
 import android.graphics.Paint
-import android.graphics.Path
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -22,7 +21,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -41,6 +39,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -104,7 +103,6 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun MainScreen() {
-        val coroutineScope = rememberCoroutineScope()
         var activeTool by remember { mutableStateOf(ToolMode.PEN) }
         var penColor by remember { mutableIntStateOf(AndroidColor.BLACK) }
         var penWidth by remember { mutableFloatStateOf(4.5f) }
@@ -181,7 +179,7 @@ class MainActivity : ComponentActivity() {
             AnimatedVisibility(
                 visible = isSidebarOpen && totalPages > 0,
                 enter = slideInHorizontally(initialOffsetX = { -it }) + fadeIn(),
-                exit = slideOutHorizontally(targetOffsetY = { 0 }, targetOffsetX = { -it }) + fadeOut(),
+                exit = slideOutHorizontally(targetOffsetX = { -it }) + fadeOut(),
                 modifier = Modifier
                     .align(Alignment.CenterStart)
                     .fillMaxHeight()
@@ -729,12 +727,12 @@ class MainActivity : ComponentActivity() {
                 val exportWidth = 1080
                 val exportHeight = 1920
 
-                val success = pdfEngine.exportAnnotatedPdf(totalPages, tempPdfFile) { pageIdx, w, h ->
+                pdfEngine.exportAnnotatedPdf(totalPages, tempPdfFile) { pageIdx ->
                     // Her sayfa için PDF arka planını render et
                     val bgBitmap = pdfEngine.renderPage(pageIdx, exportWidth, exportHeight) ?: return@exportAnnotatedPdf null
-                    
+
                     // Üzerine o sayfanın el yazısı notlarını çiz
-                    val combinedBitmap = Bitmap.createBitmap(exportWidth, exportHeight, Bitmap.Config.ARGB_8888)
+                    val combinedBitmap = Bitmap.createBitmap(bgBitmap.width, bgBitmap.height, Bitmap.Config.ARGB_8888)
                     val canvas = Canvas(combinedBitmap)
                     canvas.drawBitmap(bgBitmap, 0f, 0f, null)
 
@@ -747,20 +745,22 @@ class MainActivity : ComponentActivity() {
 
                     for (stroke in strokes) {
                         paint.color = stroke.color
-                        paint.strokeWidth = stroke.width
-                        if (stroke.mode == ToolMode.HIGHLIGHTER) {
-                            paint.alpha = 110
+                        paint.strokeWidth = stroke.strokeWidth
+                        paint.alpha = stroke.alpha
+                        if (stroke.offsetX != 0f || stroke.offsetY != 0f) {
+                            val saveCount = canvas.save()
+                            canvas.translate(stroke.offsetX, stroke.offsetY)
+                            canvas.drawPath(stroke.path, paint)
+                            canvas.restoreToCount(saveCount)
                         } else {
-                            paint.alpha = 255
+                            canvas.drawPath(stroke.path, paint)
                         }
-                        canvas.drawPath(stroke.path, paint)
                     }
 
-                    bgBitmap.recycle()
                     combinedBitmap
                 }
 
-                if (success && tempPdfFile.exists()) {
+                if (tempPdfFile.exists()) {
                     contentResolver.openOutputStream(destinationUri)?.use { out ->
                         FileInputStream(tempPdfFile).use { input ->
                             input.copyTo(out)
